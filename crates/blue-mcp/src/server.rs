@@ -597,6 +597,158 @@ impl BlueServer {
                             }
                         }
                     }
+                },
+                {
+                    "name": "blue_session_ping",
+                    "description": "Register or update session activity for an RFC.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory"
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "RFC title being worked on"
+                            },
+                            "action": {
+                                "type": "string",
+                                "description": "Session action to perform",
+                                "enum": ["start", "heartbeat", "end"]
+                            },
+                            "session_type": {
+                                "type": "string",
+                                "description": "Type of work being done (default: implementation)",
+                                "enum": ["implementation", "review", "testing"]
+                            }
+                        },
+                        "required": ["title", "action"]
+                    }
+                },
+                {
+                    "name": "blue_session_list",
+                    "description": "List active sessions on RFCs.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory"
+                            }
+                        }
+                    }
+                },
+                {
+                    "name": "blue_reminder_create",
+                    "description": "Create a gated reminder with optional time and condition triggers.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory"
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "Short reminder title"
+                            },
+                            "context": {
+                                "type": "string",
+                                "description": "Additional notes/context"
+                            },
+                            "gate": {
+                                "type": "string",
+                                "description": "Condition that must be met (optional)"
+                            },
+                            "due_date": {
+                                "type": "string",
+                                "description": "Target date YYYY-MM-DD (optional)"
+                            },
+                            "snooze_until": {
+                                "type": "string",
+                                "description": "Don't show until this date YYYY-MM-DD (optional)"
+                            },
+                            "link_to": {
+                                "type": "string",
+                                "description": "RFC/spike/decision title to link"
+                            }
+                        },
+                        "required": ["title"]
+                    }
+                },
+                {
+                    "name": "blue_reminder_list",
+                    "description": "List reminders with optional filters.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory"
+                            },
+                            "status": {
+                                "type": "string",
+                                "description": "Filter by status (default: pending)",
+                                "enum": ["pending", "snoozed", "cleared", "all"]
+                            },
+                            "include_future": {
+                                "type": "boolean",
+                                "description": "Include snoozed items not yet due (default: false)"
+                            }
+                        }
+                    }
+                },
+                {
+                    "name": "blue_reminder_snooze",
+                    "description": "Snooze a reminder until a specific date.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory"
+                            },
+                            "id": {
+                                "type": "number",
+                                "description": "Reminder ID"
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "Or match by title (partial match)"
+                            },
+                            "until": {
+                                "type": "string",
+                                "description": "New snooze date (YYYY-MM-DD)"
+                            }
+                        },
+                        "required": ["until"]
+                    }
+                },
+                {
+                    "name": "blue_reminder_clear",
+                    "description": "Clear a reminder (mark gate as resolved).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory"
+                            },
+                            "id": {
+                                "type": "number",
+                                "description": "Reminder ID"
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "Or match by title (partial match)"
+                            },
+                            "resolution": {
+                                "type": "string",
+                                "description": "How the gate was resolved"
+                            }
+                        }
+                    }
                 }
             ]
         }))
@@ -641,6 +793,13 @@ impl BlueServer {
             "blue_pr_check_approvals" => self.handle_pr_check_approvals(&call.arguments),
             "blue_pr_merge" => self.handle_pr_merge(&call.arguments),
             "blue_release_create" => self.handle_release_create(&call.arguments),
+            // Phase 4: Session and Reminder handlers
+            "blue_session_ping" => self.handle_session_ping(&call.arguments),
+            "blue_session_list" => self.handle_session_list(&call.arguments),
+            "blue_reminder_create" => self.handle_reminder_create(&call.arguments),
+            "blue_reminder_list" => self.handle_reminder_list(&call.arguments),
+            "blue_reminder_snooze" => self.handle_reminder_snooze(&call.arguments),
+            "blue_reminder_clear" => self.handle_reminder_clear(&call.arguments),
             _ => Err(ServerError::ToolNotFound(call.name)),
         }?;
 
@@ -1107,6 +1266,46 @@ impl BlueServer {
         let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
         let state = self.ensure_state()?;
         crate::handlers::release::handle_create(state, args)
+    }
+
+    // Phase 4: Session and Reminder handlers
+
+    fn handle_session_ping(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        let state = self.ensure_state()?;
+        crate::handlers::session::handle_ping(state, args)
+    }
+
+    fn handle_session_list(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let empty = json!({});
+        let args = args.as_ref().unwrap_or(&empty);
+        let state = self.ensure_state()?;
+        crate::handlers::session::handle_list(state, args)
+    }
+
+    fn handle_reminder_create(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        let state = self.ensure_state()?;
+        crate::handlers::reminder::handle_create(state, args)
+    }
+
+    fn handle_reminder_list(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let empty = json!({});
+        let args = args.as_ref().unwrap_or(&empty);
+        let state = self.ensure_state()?;
+        crate::handlers::reminder::handle_list(state, args)
+    }
+
+    fn handle_reminder_snooze(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        let state = self.ensure_state()?;
+        crate::handlers::reminder::handle_snooze(state, args)
+    }
+
+    fn handle_reminder_clear(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        let state = self.ensure_state()?;
+        crate::handlers::reminder::handle_clear(state, args)
     }
 }
 

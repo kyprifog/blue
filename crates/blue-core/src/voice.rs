@@ -34,6 +34,14 @@ pub fn ask(context: &str, question: &str) -> String {
     format!("{}. {}?", context, question)
 }
 
+/// Format an informational message in Blue's voice
+pub fn info(message: &str, detail: Option<&str>) -> String {
+    match detail {
+        Some(d) => format!("{}. {}", message, d),
+        None => message.to_string(),
+    }
+}
+
 /// The welcome message
 pub fn welcome() -> &'static str {
     r#"Welcome home.

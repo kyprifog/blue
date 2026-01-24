@@ -26,6 +26,26 @@ pub struct ProjectState {
 }
 
 impl ProjectState {
+    /// Create a test state with in-memory store (for testing only)
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn for_test() -> Self {
+        use std::path::PathBuf;
+        let store = DocumentStore::open_in_memory().unwrap();
+        Self {
+            home: BlueHome {
+                root: PathBuf::from("/test"),
+                data_path: PathBuf::from("/test/.blue/data"),
+                repos_path: PathBuf::from("/test/.blue/repos"),
+                worktrees_path: PathBuf::from("/test/.blue/worktrees"),
+                project_name: Some("test".to_string()),
+            },
+            store,
+            worktrees: Vec::new(),
+            worktree_rfcs: HashSet::new(),
+            project: "test".to_string(),
+        }
+    }
+
     /// Load project state
     pub fn load(home: BlueHome, project: &str) -> Result<Self, StateError> {
         let db_path = home.db_path(project);

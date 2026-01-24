@@ -218,13 +218,24 @@ blue/
 - [x] Blue's voice in all error messages
 - [x] 16 tests passing
 
-### Phase 4: Pending
+### Phase 4: Session and Reminders - COMPLETE
+
+- [x] store.rs - Added session and reminder tables, schema v2
+- [x] handlers/session.rs - Session ping (start/heartbeat/end) + list
+- [x] handlers/reminder.rs - Reminder CRUD with gates, snoozing, clearing
+- [x] voice.rs - Added info() function for informational messages
+- [x] 6 new MCP tools: blue_session_ping, blue_session_list,
+      blue_reminder_create, blue_reminder_list, blue_reminder_snooze,
+      blue_reminder_clear
+- [x] Total: 28 MCP tools
+- [x] Blue's voice in all error messages
+- [x] 21 tests passing
+
+### Phase 5: Pending
 
 Remaining tools to port:
 - Staging environment tools
-- Session management
 - Code search/indexing
-- Reminders
 
 ## Test Plan
 

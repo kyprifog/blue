@@ -6,5 +6,7 @@ pub mod adr;
 pub mod decision;
 pub mod pr;
 pub mod release;
+pub mod reminder;
+pub mod session;
 pub mod spike;
 pub mod worktree;

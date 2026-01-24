@@ -10,7 +10,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use tracing::{debug, info, warn};
 
 /// Current schema version
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 /// Core database schema
 const SCHEMA: &str = r#"
@@ -73,6 +73,36 @@ const SCHEMA: &str = r#"
         FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE,
         UNIQUE(document_id, key)
     );
+
+    CREATE TABLE IF NOT EXISTS sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        rfc_title TEXT NOT NULL,
+        session_type TEXT NOT NULL DEFAULT 'implementation',
+        started_at TEXT NOT NULL,
+        last_heartbeat TEXT NOT NULL,
+        ended_at TEXT,
+        UNIQUE(rfc_title)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_sessions_active ON sessions(ended_at) WHERE ended_at IS NULL;
+
+    CREATE TABLE IF NOT EXISTS reminders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        context TEXT,
+        gate TEXT,
+        due_date TEXT,
+        snooze_until TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        linked_doc_id INTEGER,
+        created_at TEXT NOT NULL,
+        cleared_at TEXT,
+        resolution TEXT,
+        FOREIGN KEY (linked_doc_id) REFERENCES documents(id) ON DELETE SET NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_reminders_status ON reminders(status);
+    CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(due_date) WHERE status = 'pending';
 "#;
 
 /// FTS5 schema for full-text search
@@ -235,6 +265,105 @@ pub struct SearchResult {
     pub document: Document,
     pub score: f64,
     pub snippet: Option<String>,
+}
+
+/// Session types for multi-agent coordination
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionType {
+    Implementation,
+    Review,
+    Testing,
+}
+
+impl SessionType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SessionType::Implementation => "implementation",
+            SessionType::Review => "review",
+            SessionType::Testing => "testing",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "implementation" => Some(SessionType::Implementation),
+            "review" => Some(SessionType::Review),
+            "testing" => Some(SessionType::Testing),
+            _ => None,
+        }
+    }
+}
+
+/// An active session on an RFC
+#[derive(Debug, Clone)]
+pub struct Session {
+    pub id: Option<i64>,
+    pub rfc_title: String,
+    pub session_type: SessionType,
+    pub started_at: String,
+    pub last_heartbeat: String,
+    pub ended_at: Option<String>,
+}
+
+/// Reminder status
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReminderStatus {
+    Pending,
+    Snoozed,
+    Cleared,
+}
+
+impl ReminderStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReminderStatus::Pending => "pending",
+            ReminderStatus::Snoozed => "snoozed",
+            ReminderStatus::Cleared => "cleared",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "pending" => Some(ReminderStatus::Pending),
+            "snoozed" => Some(ReminderStatus::Snoozed),
+            "cleared" => Some(ReminderStatus::Cleared),
+            _ => None,
+        }
+    }
+}
+
+/// A reminder with optional gate condition
+#[derive(Debug, Clone)]
+pub struct Reminder {
+    pub id: Option<i64>,
+    pub title: String,
+    pub context: Option<String>,
+    pub gate: Option<String>,
+    pub due_date: Option<String>,
+    pub snooze_until: Option<String>,
+    pub status: ReminderStatus,
+    pub linked_doc_id: Option<i64>,
+    pub created_at: Option<String>,
+    pub cleared_at: Option<String>,
+    pub resolution: Option<String>,
+}
+
+impl Reminder {
+    pub fn new(title: &str) -> Self {
+        Self {
+            id: None,
+            title: title.to_string(),
+            context: None,
+            gate: None,
+            due_date: None,
+            snooze_until: None,
+            status: ReminderStatus::Pending,
+            linked_doc_id: None,
+            created_at: None,
+            cleared_at: None,
+            resolution: None,
+        }
+    }
 }
 
 /// Store errors - in Blue's voice
@@ -935,6 +1064,309 @@ impl DocumentStore {
 
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::Database)
+    }
+
+    // ==================== Session Operations ====================
+
+    /// Start or update a session
+    pub fn upsert_session(&self, session: &Session) -> Result<i64, StoreError> {
+        self.with_retry(|| {
+            let now = chrono::Utc::now().to_rfc3339();
+
+            // Try to get existing session
+            let existing: Option<i64> = self.conn
+                .query_row(
+                    "SELECT id FROM sessions WHERE rfc_title = ?1 AND ended_at IS NULL",
+                    params![session.rfc_title],
+                    |row| row.get(0),
+                )
+                .optional()?;
+
+            match existing {
+                Some(id) => {
+                    // Update heartbeat
+                    self.conn.execute(
+                        "UPDATE sessions SET last_heartbeat = ?1, session_type = ?2 WHERE id = ?3",
+                        params![now, session.session_type.as_str(), id],
+                    )?;
+                    Ok(id)
+                }
+                None => {
+                    // Create new session
+                    self.conn.execute(
+                        "INSERT INTO sessions (rfc_title, session_type, started_at, last_heartbeat)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![
+                            session.rfc_title,
+                            session.session_type.as_str(),
+                            now,
+                            now
+                        ],
+                    )?;
+                    Ok(self.conn.last_insert_rowid())
+                }
+            }
+        })
+    }
+
+    /// End a session
+    pub fn end_session(&self, rfc_title: &str) -> Result<(), StoreError> {
+        self.with_retry(|| {
+            let now = chrono::Utc::now().to_rfc3339();
+            let updated = self.conn.execute(
+                "UPDATE sessions SET ended_at = ?1 WHERE rfc_title = ?2 AND ended_at IS NULL",
+                params![now, rfc_title],
+            )?;
+            if updated == 0 {
+                return Err(StoreError::NotFound(format!("active session for '{}'", rfc_title)));
+            }
+            Ok(())
+        })
+    }
+
+    /// Get active session for an RFC
+    pub fn get_active_session(&self, rfc_title: &str) -> Result<Option<Session>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT id, rfc_title, session_type, started_at, last_heartbeat, ended_at
+                 FROM sessions WHERE rfc_title = ?1 AND ended_at IS NULL",
+                params![rfc_title],
+                |row| {
+                    Ok(Session {
+                        id: Some(row.get(0)?),
+                        rfc_title: row.get(1)?,
+                        session_type: SessionType::from_str(&row.get::<_, String>(2)?).unwrap_or(SessionType::Implementation),
+                        started_at: row.get(3)?,
+                        last_heartbeat: row.get(4)?,
+                        ended_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::Database)
+    }
+
+    /// List all active sessions
+    pub fn list_active_sessions(&self) -> Result<Vec<Session>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, rfc_title, session_type, started_at, last_heartbeat, ended_at
+             FROM sessions WHERE ended_at IS NULL ORDER BY started_at DESC",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok(Session {
+                id: Some(row.get(0)?),
+                rfc_title: row.get(1)?,
+                session_type: SessionType::from_str(&row.get::<_, String>(2)?).unwrap_or(SessionType::Implementation),
+                started_at: row.get(3)?,
+                last_heartbeat: row.get(4)?,
+                ended_at: row.get(5)?,
+            })
+        })?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::Database)
+    }
+
+    /// Clean up stale sessions (no heartbeat in 5+ minutes)
+    pub fn cleanup_stale_sessions(&self, timeout_minutes: i64) -> Result<usize, StoreError> {
+        self.with_retry(|| {
+            let now = chrono::Utc::now();
+            let cutoff = now - chrono::Duration::minutes(timeout_minutes);
+            let cutoff_str = cutoff.to_rfc3339();
+
+            let count = self.conn.execute(
+                "UPDATE sessions SET ended_at = ?1
+                 WHERE ended_at IS NULL AND last_heartbeat < ?2",
+                params![now.to_rfc3339(), cutoff_str],
+            )?;
+            Ok(count)
+        })
+    }
+
+    // ==================== Reminder Operations ====================
+
+    /// Add a reminder
+    pub fn add_reminder(&self, reminder: &Reminder) -> Result<i64, StoreError> {
+        self.with_retry(|| {
+            let now = chrono::Utc::now().to_rfc3339();
+            self.conn.execute(
+                "INSERT INTO reminders (title, context, gate, due_date, snooze_until, status, linked_doc_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    reminder.title,
+                    reminder.context,
+                    reminder.gate,
+                    reminder.due_date,
+                    reminder.snooze_until,
+                    reminder.status.as_str(),
+                    reminder.linked_doc_id,
+                    now,
+                ],
+            )?;
+            Ok(self.conn.last_insert_rowid())
+        })
+    }
+
+    /// Get a reminder by ID
+    pub fn get_reminder(&self, id: i64) -> Result<Reminder, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT id, title, context, gate, due_date, snooze_until, status, linked_doc_id, created_at, cleared_at, resolution
+                 FROM reminders WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(Reminder {
+                        id: Some(row.get(0)?),
+                        title: row.get(1)?,
+                        context: row.get(2)?,
+                        gate: row.get(3)?,
+                        due_date: row.get(4)?,
+                        snooze_until: row.get(5)?,
+                        status: ReminderStatus::from_str(&row.get::<_, String>(6)?).unwrap_or(ReminderStatus::Pending),
+                        linked_doc_id: row.get(7)?,
+                        created_at: row.get(8)?,
+                        cleared_at: row.get(9)?,
+                        resolution: row.get(10)?,
+                    })
+                },
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => StoreError::NotFound(format!("reminder #{}", id)),
+                e => StoreError::Database(e),
+            })
+    }
+
+    /// Find reminder by title (partial match)
+    pub fn find_reminder(&self, title: &str) -> Result<Reminder, StoreError> {
+        // Try exact match first
+        if let Ok(reminder) = self.conn.query_row(
+            "SELECT id, title, context, gate, due_date, snooze_until, status, linked_doc_id, created_at, cleared_at, resolution
+             FROM reminders WHERE title = ?1 AND status != 'cleared'",
+            params![title],
+            |row| {
+                Ok(Reminder {
+                    id: Some(row.get(0)?),
+                    title: row.get(1)?,
+                    context: row.get(2)?,
+                    gate: row.get(3)?,
+                    due_date: row.get(4)?,
+                    snooze_until: row.get(5)?,
+                    status: ReminderStatus::from_str(&row.get::<_, String>(6)?).unwrap_or(ReminderStatus::Pending),
+                    linked_doc_id: row.get(7)?,
+                    created_at: row.get(8)?,
+                    cleared_at: row.get(9)?,
+                    resolution: row.get(10)?,
+                })
+            },
+        ) {
+            return Ok(reminder);
+        }
+
+        // Try partial match
+        let pattern = format!("%{}%", title.to_lowercase());
+        self.conn
+            .query_row(
+                "SELECT id, title, context, gate, due_date, snooze_until, status, linked_doc_id, created_at, cleared_at, resolution
+                 FROM reminders WHERE LOWER(title) LIKE ?1 AND status != 'cleared'
+                 ORDER BY LENGTH(title) ASC LIMIT 1",
+                params![pattern],
+                |row| {
+                    Ok(Reminder {
+                        id: Some(row.get(0)?),
+                        title: row.get(1)?,
+                        context: row.get(2)?,
+                        gate: row.get(3)?,
+                        due_date: row.get(4)?,
+                        snooze_until: row.get(5)?,
+                        status: ReminderStatus::from_str(&row.get::<_, String>(6)?).unwrap_or(ReminderStatus::Pending),
+                        linked_doc_id: row.get(7)?,
+                        created_at: row.get(8)?,
+                        cleared_at: row.get(9)?,
+                        resolution: row.get(10)?,
+                    })
+                },
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => StoreError::NotFound(format!("reminder matching '{}'", title)),
+                e => StoreError::Database(e),
+            })
+    }
+
+    /// List reminders by status
+    pub fn list_reminders(&self, status: Option<ReminderStatus>, include_future: bool) -> Result<Vec<Reminder>, StoreError> {
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+        let query = match (status, include_future) {
+            (Some(s), true) => format!(
+                "SELECT id, title, context, gate, due_date, snooze_until, status, linked_doc_id, created_at, cleared_at, resolution
+                 FROM reminders WHERE status = '{}' ORDER BY due_date ASC, created_at ASC",
+                s.as_str()
+            ),
+            (Some(s), false) => format!(
+                "SELECT id, title, context, gate, due_date, snooze_until, status, linked_doc_id, created_at, cleared_at, resolution
+                 FROM reminders WHERE status = '{}' AND (snooze_until IS NULL OR snooze_until <= '{}')
+                 ORDER BY due_date ASC, created_at ASC",
+                s.as_str(), today
+            ),
+            (None, true) => "SELECT id, title, context, gate, due_date, snooze_until, status, linked_doc_id, created_at, cleared_at, resolution
+                 FROM reminders ORDER BY due_date ASC, created_at ASC".to_string(),
+            (None, false) => format!(
+                "SELECT id, title, context, gate, due_date, snooze_until, status, linked_doc_id, created_at, cleared_at, resolution
+                 FROM reminders WHERE snooze_until IS NULL OR snooze_until <= '{}'
+                 ORDER BY due_date ASC, created_at ASC",
+                today
+            ),
+        };
+
+        let mut stmt = self.conn.prepare(&query)?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Reminder {
+                id: Some(row.get(0)?),
+                title: row.get(1)?,
+                context: row.get(2)?,
+                gate: row.get(3)?,
+                due_date: row.get(4)?,
+                snooze_until: row.get(5)?,
+                status: ReminderStatus::from_str(&row.get::<_, String>(6)?).unwrap_or(ReminderStatus::Pending),
+                linked_doc_id: row.get(7)?,
+                created_at: row.get(8)?,
+                cleared_at: row.get(9)?,
+                resolution: row.get(10)?,
+            })
+        })?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::Database)
+    }
+
+    /// Snooze a reminder
+    pub fn snooze_reminder(&self, id: i64, until: &str) -> Result<(), StoreError> {
+        self.with_retry(|| {
+            let updated = self.conn.execute(
+                "UPDATE reminders SET snooze_until = ?1, status = 'snoozed' WHERE id = ?2",
+                params![until, id],
+            )?;
+            if updated == 0 {
+                return Err(StoreError::NotFound(format!("reminder #{}", id)));
+            }
+            Ok(())
+        })
+    }
+
+    /// Clear a reminder
+    pub fn clear_reminder(&self, id: i64, resolution: Option<&str>) -> Result<(), StoreError> {
+        self.with_retry(|| {
+            let now = chrono::Utc::now().to_rfc3339();
+            let updated = self.conn.execute(
+                "UPDATE reminders SET status = 'cleared', cleared_at = ?1, resolution = ?2 WHERE id = ?3",
+                params![now, resolution, id],
+            )?;
+            if updated == 0 {
+                return Err(StoreError::NotFound(format!("reminder #{}", id)));
+            }
+            Ok(())
+        })
     }
 }
 
