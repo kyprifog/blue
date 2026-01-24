@@ -18,18 +18,27 @@ Shall we get started?
 
 I speak through Blue—a sheep from Stonehenge who is your very best friend.
 
+## Install
+
+```bash
+./install.sh
+```
+
+Installs CLI to `/usr/local/bin` and configures MCP for Claude Code. See [INSTALL.md](INSTALL.md) for details.
+
 ## Getting Started
 
 ```bash
-💙 init       # Welcome home
-💙 create     # Start a new idea
-💙 plan       # Break it into steps
-💙 status     # Where are we?
-💙 next       # What's next?
+blue init       # Welcome home
+blue create     # Start a new idea
+blue plan       # Break it into steps
+blue status     # Where are we?
+blue next       # What's next?
 ```
 
-## The 13 Beliefs
+## The Beliefs
 
+0. **Never Give Up** — The ground everything stands on
 1. **Purpose** — We exist to make work meaningful and workers present
 2. **Presence** — The quality of actually being here while you work
 3. **Home** — You are never lost. You are home.
@@ -43,6 +52,46 @@ I speak through Blue—a sheep from Stonehenge who is your very best friend.
 11. **Freedom Through Constraint** — The riverbed enables the river
 12. **Faith** — Act on justified belief, not just proven fact
 13. **Overflow** — Build from fullness, not emptiness
+
+## MCP Tools
+
+Blue speaks to Claude via MCP (Model Context Protocol). Eight tools for cross-repo coordination:
+
+| Tool | What it does |
+|------|--------------|
+| `realm_status` | Realm overview with repos, domains, contracts |
+| `realm_check` | Validate contracts for CI |
+| `contract_get` | Get contract details and schema |
+| `session_start` | Begin a work session |
+| `session_stop` | End session with summary |
+| `realm_worktree_create` | Create worktrees for multi-repo work |
+| `realm_pr_status` | Check PR readiness across repos |
+| `notifications_list` | List contract change notifications |
+
+See [docs/mcp](docs/mcp/) for full documentation.
+
+### Quick Setup
+
+```bash
+# Build Blue
+cargo build --release
+
+# Configure Claude Code (~/.config/claude-code/mcp.json)
+{
+  "mcpServers": {
+    "blue": {
+      "command": "blue",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Then in Claude:
+```
+Human: What's my realm status?
+Claude: [calls realm_status] You're in aperture/blue...
+```
 
 ## Blue
 
