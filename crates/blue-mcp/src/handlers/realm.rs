@@ -546,11 +546,6 @@ pub fn handle_session_stop(cwd: Option<&Path>) -> Result<Value, ServerError> {
     }))
 }
 
-/// Get current session if one exists (for other tools to check)
-pub fn get_current_session(cwd: Option<&Path>) -> Option<SessionState> {
-    cwd.and_then(SessionState::load)
-}
-
 // ─── Phase 3: Workflow Tools ────────────────────────────────────────────────
 
 /// Handle worktree_create - create worktrees for realm repos

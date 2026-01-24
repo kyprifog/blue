@@ -2,6 +2,7 @@
 //!
 //! Handles JSON-RPC requests and routes to appropriate tool handlers.
 
+use std::fs;
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -1354,9 +1355,8 @@ impl BlueServer {
                         "required": ["title"]
                     }
                 },
-                // Phase 10: Realm tools (RFC 0002)
                 {
-                    "name": "realm_status",
+                    "name": "blue_realm_status",
                     "description": "Get realm overview including repos, domains, contracts, and bindings. Returns pending notifications.",
                     "inputSchema": {
                         "type": "object",
@@ -1370,7 +1370,7 @@ impl BlueServer {
                     }
                 },
                 {
-                    "name": "realm_check",
+                    "name": "blue_realm_check",
                     "description": "Validate realm contracts and bindings. Returns errors and warnings including schema-without-version changes.",
                     "inputSchema": {
                         "type": "object",
@@ -1388,7 +1388,7 @@ impl BlueServer {
                     }
                 },
                 {
-                    "name": "contract_get",
+                    "name": "blue_contract_get",
                     "description": "Get contract details including schema, value, version, owner, and bindings.",
                     "inputSchema": {
                         "type": "object",
@@ -1411,7 +1411,7 @@ impl BlueServer {
                 },
                 // Phase 2: Session tools (RFC 0002)
                 {
-                    "name": "session_start",
+                    "name": "blue_session_start",
                     "description": "Begin a work session. Tracks active realm, repo, domains, and contracts being modified or watched. Returns session ID and context.",
                     "inputSchema": {
                         "type": "object",
@@ -1429,7 +1429,7 @@ impl BlueServer {
                     }
                 },
                 {
-                    "name": "session_stop",
+                    "name": "blue_session_stop",
                     "description": "End the current work session. Returns summary including duration, domains touched, and contracts modified.",
                     "inputSchema": {
                         "type": "object",
@@ -1444,7 +1444,7 @@ impl BlueServer {
                 },
                 // Phase 3: Workflow tools (RFC 0002)
                 {
-                    "name": "realm_worktree_create",
+                    "name": "blue_realm_worktree_create",
                     "description": "Create git worktrees for coordinated multi-repo development. Auto-selects domain peers (repos sharing domains) by default.",
                     "inputSchema": {
                         "type": "object",
@@ -1467,7 +1467,7 @@ impl BlueServer {
                     }
                 },
                 {
-                    "name": "realm_pr_status",
+                    "name": "blue_realm_pr_status",
                     "description": "Get PR readiness across realm repos. Shows uncommitted changes, commits ahead, and PR status for coordinated releases.",
                     "inputSchema": {
                         "type": "object",
@@ -1486,7 +1486,7 @@ impl BlueServer {
                 },
                 // Phase 4: Notifications (RFC 0002)
                 {
-                    "name": "notifications_list",
+                    "name": "blue_notifications_list",
                     "description": "List notifications with state filters. States: pending (unseen), seen (acknowledged), expired (7+ days old). Auto-cleans expired notifications.",
                     "inputSchema": {
                         "type": "object",
@@ -1593,14 +1593,14 @@ impl BlueServer {
             "blue_runbook_create" => self.handle_runbook_create(&call.arguments),
             "blue_runbook_update" => self.handle_runbook_update(&call.arguments),
             // Phase 10: Realm tools (RFC 0002)
-            "realm_status" => self.handle_realm_status(&call.arguments),
-            "realm_check" => self.handle_realm_check(&call.arguments),
-            "contract_get" => self.handle_contract_get(&call.arguments),
-            "session_start" => self.handle_session_start(&call.arguments),
-            "session_stop" => self.handle_session_stop(&call.arguments),
-            "realm_worktree_create" => self.handle_realm_worktree_create(&call.arguments),
-            "realm_pr_status" => self.handle_realm_pr_status(&call.arguments),
-            "notifications_list" => self.handle_notifications_list(&call.arguments),
+            "blue_realm_status" => self.handle_realm_status(&call.arguments),
+            "blue_realm_check" => self.handle_realm_check(&call.arguments),
+            "blue_contract_get" => self.handle_contract_get(&call.arguments),
+            "blue_session_start" => self.handle_session_start(&call.arguments),
+            "blue_session_stop" => self.handle_session_stop(&call.arguments),
+            "blue_realm_worktree_create" => self.handle_realm_worktree_create(&call.arguments),
+            "blue_realm_pr_status" => self.handle_realm_pr_status(&call.arguments),
+            "blue_notifications_list" => self.handle_notifications_list(&call.arguments),
             _ => Err(ServerError::ToolNotFound(call.name)),
         }?;
 
@@ -1703,13 +1703,6 @@ impl BlueServer {
                 let number = state.store.next_number(DocType::Rfc)
                     .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
 
-                // Create document in store
-                let mut doc = Document::new(DocType::Rfc, title, "draft");
-                doc.number = Some(number);
-
-                let id = state.store.add_document(&doc)
-                    .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
-
                 // Generate markdown
                 let mut rfc = Rfc::new(title);
                 if let Some(p) = problem {
@@ -1721,11 +1714,31 @@ impl BlueServer {
 
                 let markdown = rfc.to_markdown(number as u32);
 
+                // Generate filename and write file
+                let filename = format!("rfcs/{:04}-{}.md", number, title);
+                let docs_path = state.home.docs_path(&state.project);
+                let rfc_path = docs_path.join(&filename);
+                if let Some(parent) = rfc_path.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
+                }
+                fs::write(&rfc_path, &markdown)
+                    .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
+
+                // Create document in store with file path
+                let mut doc = Document::new(DocType::Rfc, title, "draft");
+                doc.number = Some(number);
+                doc.file_path = Some(filename.clone());
+
+                let id = state.store.add_document(&doc)
+                    .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
+
                 Ok(json!({
                     "status": "success",
                     "id": id,
                     "number": number,
                     "title": title,
+                    "file": rfc_path.display().to_string(),
                     "markdown": markdown,
                     "message": blue_core::voice::success(
                         &format!("Created RFC {:04}: '{}'", number, title),
