@@ -196,7 +196,26 @@ blue/
 - [x] 14 unit tests passing
 - [x] Blue's voice in all error messages
 
-### Phase 2-4: Pending
+### Phase 2: Workflow - COMPLETE
+
+- [x] handlers/spike.rs - Spike create/complete with RFC enforcement
+- [x] handlers/adr.rs - ADR creation with RFC linking
+- [x] handlers/decision.rs - Lightweight Decision Notes
+- [x] handlers/worktree.rs - Git worktree operations
+- [x] 7 new MCP tools: blue_spike_create, blue_spike_complete,
+      blue_adr_create, blue_decision_create, blue_worktree_create,
+      blue_worktree_list, blue_worktree_remove
+- [x] Total: 16 MCP tools, 842 new lines of code
+- [x] Blue's voice in all error messages
+
+### Phase 3-4: Pending
+
+Remaining tools to port:
+- PR workflow (blue_pr_create, blue_pr_verify, blue_pr_merge)
+- Release management (blue_release_create)
+- Staging environment tools
+- Session management
+- Code search/indexing
 
 ## Test Plan
 
