@@ -32,6 +32,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # CLI
 clap = { version = "4.0", features = ["derive"] }
 
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Git
+git2 = "0.19"
+
 # Internal
 blue-core = { path = "crates/blue-core" }
 blue-mcp = { path = "crates/blue-mcp" }

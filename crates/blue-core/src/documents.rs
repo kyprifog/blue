@@ -1,6 +1,6 @@
 //! Document types for Blue
 //!
-//! RFCs, ADRs, Spikes, and other document structures.
+//! RFCs, ADRs, Spikes, and other document structures with markdown generation.
 
 use serde::{Deserialize, Serialize};
 
@@ -15,14 +15,30 @@ pub enum Status {
     Superseded,
 }
 
+impl Status {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Status::Draft => "draft",
+            Status::Accepted => "accepted",
+            Status::InProgress => "in-progress",
+            Status::Implemented => "implemented",
+            Status::Superseded => "superseded",
+        }
+    }
+}
+
 /// An RFC (Request for Comments) - a design document
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rfc {
     pub title: String,
     pub status: Status,
+    pub date: Option<String>,
+    pub source_spike: Option<String>,
+    pub source_prd: Option<String>,
     pub problem: Option<String>,
     pub proposal: Option<String>,
     pub goals: Vec<String>,
+    pub non_goals: Vec<String>,
     pub plan: Vec<Task>,
 }
 
@@ -37,10 +53,13 @@ pub struct Task {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Spike {
     pub title: String,
-    pub question: String,
+    pub status: String,
+    pub date: String,
     pub time_box: Option<String>,
+    pub question: String,
     pub outcome: Option<SpikeOutcome>,
-    pub summary: Option<String>,
+    pub findings: Option<String>,
+    pub recommendation: Option<String>,
 }
 
 /// Outcome of a spike investigation
@@ -52,10 +71,21 @@ pub enum SpikeOutcome {
     RecommendsImplementation,
 }
 
+impl SpikeOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SpikeOutcome::NoAction => "no-action",
+            SpikeOutcome::DecisionMade => "decision-made",
+            SpikeOutcome::RecommendsImplementation => "recommends-implementation",
+        }
+    }
+}
+
 /// A Decision Note - lightweight choice documentation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Decision {
     pub title: String,
+    pub date: String,
     pub decision: String,
     pub rationale: Option<String>,
     pub alternatives: Vec<String>,
@@ -65,6 +95,9 @@ pub struct Decision {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Adr {
     pub title: String,
+    pub status: String,
+    pub date: String,
+    pub source_rfc: Option<String>,
     pub context: String,
     pub decision: String,
     pub consequences: Vec<String>,
@@ -76,9 +109,13 @@ impl Rfc {
         Self {
             title: title.into(),
             status: Status::Draft,
+            date: Some(today()),
+            source_spike: None,
+            source_prd: None,
             problem: None,
             proposal: None,
             goals: Vec::new(),
+            non_goals: Vec::new(),
             plan: Vec::new(),
         }
     }
@@ -91,6 +128,78 @@ impl Rfc {
         let completed = self.plan.iter().filter(|t| t.completed).count();
         (completed as f64 / self.plan.len() as f64) * 100.0
     }
+
+    /// Generate markdown content
+    pub fn to_markdown(&self, number: u32) -> String {
+        let mut md = String::new();
+
+        // Title
+        md.push_str(&format!(
+            "# RFC {:04}: {}\n\n",
+            number,
+            to_title_case(&self.title)
+        ));
+
+        // Metadata table
+        md.push_str("| | |\n|---|---|\n");
+        md.push_str(&format!(
+            "| **Status** | {} |\n",
+            to_title_case(self.status.as_str())
+        ));
+        if let Some(ref date) = self.date {
+            md.push_str(&format!("| **Date** | {} |\n", date));
+        }
+        if let Some(ref spike) = self.source_spike {
+            md.push_str(&format!("| **Source Spike** | {} |\n", spike));
+        }
+        if let Some(ref prd) = self.source_prd {
+            md.push_str(&format!("| **Source PRD** | {} |\n", prd));
+        }
+        md.push_str("\n---\n\n");
+
+        // Summary (problem)
+        if let Some(ref problem) = self.problem {
+            md.push_str("## Summary\n\n");
+            md.push_str(problem);
+            md.push_str("\n\n");
+        }
+
+        // Proposal
+        if let Some(ref proposal) = self.proposal {
+            md.push_str("## Proposal\n\n");
+            md.push_str(proposal);
+            md.push_str("\n\n");
+        }
+
+        // Goals
+        if !self.goals.is_empty() {
+            md.push_str("## Goals\n\n");
+            for goal in &self.goals {
+                md.push_str(&format!("- {}\n", goal));
+            }
+            md.push('\n');
+        }
+
+        // Non-Goals
+        if !self.non_goals.is_empty() {
+            md.push_str("## Non-Goals\n\n");
+            for ng in &self.non_goals {
+                md.push_str(&format!("- {}\n", ng));
+            }
+            md.push('\n');
+        }
+
+        // Test Plan (empty checkboxes)
+        md.push_str("## Test Plan\n\n");
+        md.push_str("- [ ] TBD\n\n");
+
+        // Blue's signature
+        md.push_str("---\n\n");
+        md.push_str("*\"Right then. Let's get to it.\"*\n\n");
+        md.push_str("— Blue\n");
+
+        md
+    }
 }
 
 impl Spike {
@@ -98,10 +207,208 @@ impl Spike {
     pub fn new(title: impl Into<String>, question: impl Into<String>) -> Self {
         Self {
             title: title.into(),
-            question: question.into(),
+            status: "in-progress".to_string(),
+            date: today(),
             time_box: None,
+            question: question.into(),
             outcome: None,
-            summary: None,
+            findings: None,
+            recommendation: None,
         }
+    }
+
+    /// Generate markdown content
+    pub fn to_markdown(&self) -> String {
+        let mut md = String::new();
+
+        md.push_str(&format!("# Spike: {}\n\n", to_title_case(&self.title)));
+
+        md.push_str("| | |\n|---|---|\n");
+        md.push_str(&format!(
+            "| **Status** | {} |\n",
+            to_title_case(&self.status)
+        ));
+        md.push_str(&format!("| **Date** | {} |\n", self.date));
+        if let Some(ref tb) = self.time_box {
+            md.push_str(&format!("| **Time Box** | {} |\n", tb));
+        }
+        if let Some(ref outcome) = self.outcome {
+            md.push_str(&format!("| **Outcome** | {} |\n", outcome.as_str()));
+        }
+        md.push_str("\n---\n\n");
+
+        md.push_str("## Question\n\n");
+        md.push_str(&self.question);
+        md.push_str("\n\n");
+
+        if let Some(ref findings) = self.findings {
+            md.push_str("## Findings\n\n");
+            md.push_str(findings);
+            md.push_str("\n\n");
+        }
+
+        if let Some(ref rec) = self.recommendation {
+            md.push_str("## Recommendation\n\n");
+            md.push_str(rec);
+            md.push_str("\n\n");
+        }
+
+        md.push_str("---\n\n");
+        md.push_str("*Investigation notes by Blue*\n");
+
+        md
+    }
+}
+
+impl Adr {
+    /// Create a new ADR
+    pub fn new(title: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            status: "accepted".to_string(),
+            date: today(),
+            source_rfc: None,
+            context: String::new(),
+            decision: String::new(),
+            consequences: Vec::new(),
+        }
+    }
+
+    /// Generate markdown content
+    pub fn to_markdown(&self, number: u32) -> String {
+        let mut md = String::new();
+
+        md.push_str(&format!(
+            "# ADR {:04}: {}\n\n",
+            number,
+            to_title_case(&self.title)
+        ));
+
+        md.push_str("| | |\n|---|---|\n");
+        md.push_str(&format!(
+            "| **Status** | {} |\n",
+            to_title_case(&self.status)
+        ));
+        md.push_str(&format!("| **Date** | {} |\n", self.date));
+        if let Some(ref rfc) = self.source_rfc {
+            md.push_str(&format!("| **RFC** | {} |\n", rfc));
+        }
+        md.push_str("\n---\n\n");
+
+        md.push_str("## Context\n\n");
+        md.push_str(&self.context);
+        md.push_str("\n\n");
+
+        md.push_str("## Decision\n\n");
+        md.push_str(&self.decision);
+        md.push_str("\n\n");
+
+        if !self.consequences.is_empty() {
+            md.push_str("## Consequences\n\n");
+            for c in &self.consequences {
+                md.push_str(&format!("- {}\n", c));
+            }
+            md.push('\n');
+        }
+
+        md.push_str("---\n\n");
+        md.push_str("*Recorded by Blue*\n");
+
+        md
+    }
+}
+
+impl Decision {
+    /// Create a new Decision
+    pub fn new(title: impl Into<String>, decision: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            date: today(),
+            decision: decision.into(),
+            rationale: None,
+            alternatives: Vec::new(),
+        }
+    }
+
+    /// Generate markdown content
+    pub fn to_markdown(&self) -> String {
+        let mut md = String::new();
+
+        md.push_str(&format!("# Decision: {}\n\n", to_title_case(&self.title)));
+        md.push_str(&format!("**Date:** {}\n\n", self.date));
+
+        md.push_str("## Decision\n\n");
+        md.push_str(&self.decision);
+        md.push_str("\n\n");
+
+        if let Some(ref rationale) = self.rationale {
+            md.push_str("## Rationale\n\n");
+            md.push_str(rationale);
+            md.push_str("\n\n");
+        }
+
+        if !self.alternatives.is_empty() {
+            md.push_str("## Alternatives Considered\n\n");
+            for alt in &self.alternatives {
+                md.push_str(&format!("- {}\n", alt));
+            }
+            md.push('\n');
+        }
+
+        md.push_str("---\n\n");
+        md.push_str("*Noted by Blue*\n");
+
+        md
+    }
+}
+
+/// Get current date in YYYY-MM-DD format
+fn today() -> String {
+    chrono::Utc::now().format("%Y-%m-%d").to_string()
+}
+
+/// Convert kebab-case to Title Case
+fn to_title_case(s: &str) -> String {
+    s.split('-')
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(first) => first.to_uppercase().chain(chars).collect(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rfc_to_markdown() {
+        let mut rfc = Rfc::new("my-feature");
+        rfc.problem = Some("Things are slow".to_string());
+        rfc.goals = vec!["Make it fast".to_string()];
+
+        let md = rfc.to_markdown(1);
+        assert!(md.contains("# RFC 0001: My Feature"));
+        assert!(md.contains("Things are slow"));
+        assert!(md.contains("Make it fast"));
+        assert!(md.contains("— Blue"));
+    }
+
+    #[test]
+    fn test_title_case() {
+        assert_eq!(to_title_case("my-feature"), "My Feature");
+        assert_eq!(to_title_case("in-progress"), "In Progress");
+    }
+
+    #[test]
+    fn test_spike_to_markdown() {
+        let spike = Spike::new("test-investigation", "What should we do?");
+        let md = spike.to_markdown();
+        assert!(md.contains("# Spike: Test Investigation"));
+        assert!(md.contains("What should we do?"));
     }
 }
