@@ -189,9 +189,11 @@ All tools return `next_steps` suggestions based on state:
 - Tracks active RFC, domains, contracts modified/watched
 - Daemon integration deferred to Phase 4
 
-### Phase 3: Workflow Tools
-- `worktree_create` with domain peer selection
-- `pr_status` across worktrees
+### Phase 3: Workflow Tools ✓
+- `realm_worktree_create` with domain peer selection
+- `realm_pr_status` across worktrees
+- Creates worktrees under `~/.blue/worktrees/<realm>/<rfc>/`
+- Auto-selects domain peers (repos sharing domains with current repo)
 
 ### Phase 4: Notifications
 - `notifications_list` with state filters

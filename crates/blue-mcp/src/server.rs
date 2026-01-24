@@ -1441,6 +1441,48 @@ impl BlueServer {
                         },
                         "required": ["cwd"]
                     }
+                },
+                // Phase 3: Workflow tools (RFC 0002)
+                {
+                    "name": "realm_worktree_create",
+                    "description": "Create git worktrees for coordinated multi-repo development. Auto-selects domain peers (repos sharing domains) by default.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory (must be in a realm repo)"
+                            },
+                            "rfc": {
+                                "type": "string",
+                                "description": "RFC name for branch naming (creates rfc/<name> branches)"
+                            },
+                            "repos": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Specific repos to create worktrees for (defaults to domain peers)"
+                            }
+                        },
+                        "required": ["cwd", "rfc"]
+                    }
+                },
+                {
+                    "name": "realm_pr_status",
+                    "description": "Get PR readiness across realm repos. Shows uncommitted changes, commits ahead, and PR status for coordinated releases.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory (must be in a realm repo)"
+                            },
+                            "rfc": {
+                                "type": "string",
+                                "description": "RFC name to check specific branches (rfc/<name>)"
+                            }
+                        },
+                        "required": ["cwd"]
+                    }
                 }
             ]
         }))
@@ -1536,6 +1578,8 @@ impl BlueServer {
             "contract_get" => self.handle_contract_get(&call.arguments),
             "session_start" => self.handle_session_start(&call.arguments),
             "session_stop" => self.handle_session_stop(&call.arguments),
+            "realm_worktree_create" => self.handle_realm_worktree_create(&call.arguments),
+            "realm_pr_status" => self.handle_realm_pr_status(&call.arguments),
             _ => Err(ServerError::ToolNotFound(call.name)),
         }?;
 
@@ -2272,6 +2316,29 @@ impl BlueServer {
 
     fn handle_session_stop(&mut self, _args: &Option<Value>) -> Result<Value, ServerError> {
         crate::handlers::realm::handle_session_stop(self.cwd.as_deref())
+    }
+
+    // Phase 3: Workflow handlers (RFC 0002)
+
+    fn handle_realm_worktree_create(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        let rfc = args
+            .get("rfc")
+            .and_then(|v| v.as_str())
+            .ok_or(ServerError::InvalidParams)?;
+        let repos: Option<Vec<&str>> = args
+            .get("repos")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect());
+        crate::handlers::realm::handle_worktree_create(self.cwd.as_deref(), rfc, repos)
+    }
+
+    fn handle_realm_pr_status(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let rfc = args
+            .as_ref()
+            .and_then(|a| a.get("rfc"))
+            .and_then(|v| v.as_str());
+        crate::handlers::realm::handle_pr_status(self.cwd.as_deref(), rfc)
     }
 }
 

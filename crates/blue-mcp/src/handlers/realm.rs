@@ -521,6 +521,359 @@ pub fn get_current_session(cwd: Option<&Path>) -> Option<SessionState> {
     cwd.and_then(SessionState::load)
 }
 
+// ─── Phase 3: Workflow Tools ────────────────────────────────────────────────
+
+/// Handle worktree_create - create worktrees for realm repos
+///
+/// Creates git worktrees for coordinated multi-repo development.
+/// Default: selects "domain peers" - repos sharing domains with current repo.
+pub fn handle_worktree_create(
+    cwd: Option<&Path>,
+    rfc: &str,
+    repos: Option<Vec<&str>>,
+) -> Result<Value, ServerError> {
+    let cwd = cwd.ok_or(ServerError::InvalidParams)?;
+    let ctx = detect_context(Some(cwd))?;
+
+    // Load realm details to find domain peers
+    let details = ctx.service.load_realm_details(&ctx.realm_name).map_err(|e| {
+        ServerError::CommandFailed(format!("Failed to load realm: {}", e))
+    })?;
+
+    // Determine which repos to create worktrees for
+    let (selected_repos, selection_reason) = if let Some(explicit_repos) = repos {
+        // User specified repos explicitly
+        let repo_list: Vec<String> = explicit_repos.iter().map(|s| s.to_string()).collect();
+        (repo_list, "Explicitly specified".to_string())
+    } else {
+        // Auto-select domain peers
+        let mut peers: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut peer_domains: Vec<String> = Vec::new();
+
+        for domain in &details.domains {
+            let has_current_repo = domain.bindings.iter().any(|b| b.repo == ctx.repo_name);
+            if has_current_repo {
+                peer_domains.push(domain.domain.name.clone());
+                for binding in &domain.bindings {
+                    peers.insert(binding.repo.clone());
+                }
+            }
+        }
+
+        let repo_list: Vec<String> = peers.into_iter().collect();
+        let reason = if peer_domains.is_empty() {
+            "No shared domains - current repo only".to_string()
+        } else {
+            format!("Domain peers via {}", peer_domains.join(", "))
+        };
+
+        // If no peers found, just use current repo
+        if repo_list.is_empty() {
+            (vec![ctx.repo_name.clone()], "Solo repo in realm".to_string())
+        } else {
+            (repo_list, reason)
+        }
+    };
+
+    // Get daemon paths for worktree location
+    let paths = DaemonPaths::new().map_err(|e| {
+        ServerError::CommandFailed(format!("Failed to get daemon paths: {}", e))
+    })?;
+
+    // Create worktrees under ~/.blue/worktrees/<realm>/<rfc>/
+    let worktree_base = paths.base.join("worktrees").join(&ctx.realm_name).join(rfc);
+    let mut created: Vec<String> = Vec::new();
+    let mut paths_map: serde_json::Map<String, Value> = serde_json::Map::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    for repo_name in &selected_repos {
+        // Find repo path from realm details
+        let repo_info = details.repos.iter().find(|r| &r.name == repo_name);
+        let repo_path = match repo_info {
+            Some(info) => match &info.path {
+                Some(p) => std::path::PathBuf::from(p),
+                None => {
+                    errors.push(format!("Repo '{}' has no local path configured", repo_name));
+                    continue;
+                }
+            },
+            None => {
+                errors.push(format!("Repo '{}' not found in realm", repo_name));
+                continue;
+            }
+        };
+
+        // Open the repository
+        let repo = match git2::Repository::open(&repo_path) {
+            Ok(r) => r,
+            Err(e) => {
+                errors.push(format!("Failed to open '{}': {}", repo_name, e));
+                continue;
+            }
+        };
+
+        let branch_name = format!("rfc/{}", rfc);
+        let worktree_path = worktree_base.join(repo_name);
+
+        // Create parent directories
+        if let Some(parent) = worktree_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                errors.push(format!("Failed to create dirs for '{}': {}", repo_name, e));
+                continue;
+            }
+        }
+
+        // Create worktree using git2
+        match create_git_worktree(&repo, &branch_name, &worktree_path) {
+            Ok(()) => {
+                created.push(repo_name.clone());
+                paths_map.insert(
+                    repo_name.clone(),
+                    Value::String(worktree_path.display().to_string()),
+                );
+            }
+            Err(e) => {
+                errors.push(format!("Failed to create worktree for '{}': {}", repo_name, e));
+            }
+        }
+    }
+
+    // Build next steps
+    let mut next_steps = Vec::new();
+    if !created.is_empty() {
+        let first_path = paths_map.values().next().and_then(|v| v.as_str());
+        if let Some(p) = first_path {
+            next_steps.push(format!("cd {} to start working", p));
+        }
+        next_steps.push("Use session_start to track your work".to_string());
+    }
+    if !errors.is_empty() {
+        next_steps.push("Review errors and fix before proceeding".to_string());
+    }
+
+    let status = if errors.is_empty() { "success" } else if created.is_empty() { "error" } else { "partial" };
+
+    Ok(json!({
+        "status": status,
+        "rfc": rfc,
+        "realm": ctx.realm_name,
+        "reason": selection_reason,
+        "created": created,
+        "paths": paths_map,
+        "errors": errors,
+        "next_steps": next_steps
+    }))
+}
+
+/// Create a git worktree with a new branch
+fn create_git_worktree(
+    repo: &git2::Repository,
+    branch_name: &str,
+    worktree_path: &std::path::Path,
+) -> Result<(), String> {
+    // Check if worktree already exists
+    if worktree_path.exists() {
+        return Err("Worktree path already exists".to_string());
+    }
+
+    // Get HEAD commit to branch from
+    let head = repo.head().map_err(|e| format!("Failed to get HEAD: {}", e))?;
+    let commit = head.peel_to_commit().map_err(|e| format!("Failed to get commit: {}", e))?;
+
+    // Check if branch exists, create if not
+    let branch = match repo.find_branch(branch_name, git2::BranchType::Local) {
+        Ok(b) => b,
+        Err(_) => {
+            // Create new branch
+            repo.branch(branch_name, &commit, false)
+                .map_err(|e| format!("Failed to create branch: {}", e))?
+        }
+    };
+
+    // Get the reference for the worktree
+    let reference = branch.into_reference();
+
+    // Create the worktree
+    repo.worktree(
+        branch_name,
+        worktree_path,
+        Some(git2::WorktreeAddOptions::new().reference(Some(&reference))),
+    )
+    .map_err(|e| format!("Failed to create worktree: {}", e))?;
+
+    Ok(())
+}
+
+/// Handle pr_status - get PR readiness across realm repos
+///
+/// Shows uncommitted changes, commits ahead, and PR status for each repo.
+pub fn handle_pr_status(cwd: Option<&Path>, rfc: Option<&str>) -> Result<Value, ServerError> {
+    let cwd = cwd.ok_or(ServerError::InvalidParams)?;
+    let ctx = detect_context(Some(cwd))?;
+
+    // Load realm details
+    let details = ctx.service.load_realm_details(&ctx.realm_name).map_err(|e| {
+        ServerError::CommandFailed(format!("Failed to load realm: {}", e))
+    })?;
+
+    let branch_name = rfc.map(|r| format!("rfc/{}", r));
+    let mut repos_status: Vec<Value> = Vec::new();
+    let mut all_clean = true;
+    let mut all_pushed = true;
+
+    for repo_info in &details.repos {
+        let repo_path = match &repo_info.path {
+            Some(p) => std::path::PathBuf::from(p),
+            None => {
+                repos_status.push(json!({
+                    "name": repo_info.name,
+                    "path": null,
+                    "is_current": repo_info.name == ctx.repo_name,
+                    "error": "No local path configured",
+                    "ready": false
+                }));
+                all_clean = false;
+                continue;
+            }
+        };
+
+        let status = match git2::Repository::open(&repo_path) {
+            Ok(repo) => {
+                let (uncommitted, commits_ahead) = get_repo_status(&repo, branch_name.as_deref());
+
+                if uncommitted > 0 {
+                    all_clean = false;
+                }
+                if commits_ahead > 0 {
+                    all_pushed = false;
+                }
+
+                // Check for PR if we have gh CLI
+                let pr_info = get_pr_info(&repo_path, branch_name.as_deref());
+
+                json!({
+                    "name": repo_info.name,
+                    "path": repo_path.display().to_string(),
+                    "is_current": repo_info.name == ctx.repo_name,
+                    "uncommitted_changes": uncommitted,
+                    "commits_ahead": commits_ahead,
+                    "pr": pr_info,
+                    "ready": uncommitted == 0 && commits_ahead == 0
+                })
+            }
+            Err(e) => {
+                all_clean = false;
+                json!({
+                    "name": repo_info.name,
+                    "path": repo_path.display().to_string(),
+                    "is_current": repo_info.name == ctx.repo_name,
+                    "error": format!("Failed to open: {}", e),
+                    "ready": false
+                })
+            }
+        };
+
+        repos_status.push(status);
+    }
+
+    // Build next steps
+    let mut next_steps = Vec::new();
+    if !all_clean {
+        next_steps.push("Commit changes in repos with uncommitted files".to_string());
+    }
+    if !all_pushed {
+        next_steps.push("Push commits to remote branches".to_string());
+    }
+    if all_clean && all_pushed {
+        next_steps.push("All repos ready. Create PRs with 'gh pr create'.".to_string());
+    }
+
+    Ok(json!({
+        "status": "success",
+        "realm": ctx.realm_name,
+        "current_repo": ctx.repo_name,
+        "rfc": rfc,
+        "repos": repos_status,
+        "summary": {
+            "all_clean": all_clean,
+            "all_pushed": all_pushed,
+            "ready_for_pr": all_clean && all_pushed
+        },
+        "next_steps": next_steps
+    }))
+}
+
+/// Get repository status (uncommitted changes, commits ahead)
+fn get_repo_status(repo: &git2::Repository, branch_name: Option<&str>) -> (usize, usize) {
+    // Count uncommitted changes
+    let uncommitted = match repo.statuses(None) {
+        Ok(statuses) => statuses.len(),
+        Err(_) => 0,
+    };
+
+    // Count commits ahead of remote
+    let commits_ahead = if let Some(branch) = branch_name {
+        count_commits_ahead(repo, branch).unwrap_or(0)
+    } else {
+        // Use current branch
+        if let Ok(head) = repo.head() {
+            if let Some(name) = head.shorthand() {
+                count_commits_ahead(repo, name).unwrap_or(0)
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    };
+
+    (uncommitted, commits_ahead)
+}
+
+/// Count commits ahead of upstream
+fn count_commits_ahead(repo: &git2::Repository, branch_name: &str) -> Result<usize, git2::Error> {
+    let local = repo.find_branch(branch_name, git2::BranchType::Local)?;
+    let local_commit = local.get().peel_to_commit()?;
+
+    // Try to find upstream
+    let upstream_name = format!("origin/{}", branch_name);
+    let upstream = match repo.find_branch(&upstream_name, git2::BranchType::Remote) {
+        Ok(b) => b,
+        Err(_) => return Ok(0), // No upstream, all commits are "ahead"
+    };
+    let upstream_commit = upstream.get().peel_to_commit()?;
+
+    // Count commits between upstream and local
+    let (ahead, _behind) = repo.graph_ahead_behind(local_commit.id(), upstream_commit.id())?;
+    Ok(ahead)
+}
+
+/// Get PR info from gh CLI (returns None if no PR or gh not available)
+fn get_pr_info(repo_path: &std::path::Path, branch_name: Option<&str>) -> Option<Value> {
+    use std::process::Command;
+
+    let mut cmd = Command::new("gh");
+    cmd.current_dir(repo_path);
+    cmd.args(["pr", "view", "--json", "number,state,url,title"]);
+
+    if let Some(branch) = branch_name {
+        cmd.args(["--head", branch]);
+    }
+
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let data: Value = serde_json::from_slice(&output.stdout).ok()?;
+    Some(json!({
+        "number": data["number"],
+        "state": data["state"],
+        "url": data["url"],
+        "title": data["title"]
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
