@@ -831,6 +831,55 @@ impl BlueServer {
                             }
                         }
                     }
+                },
+                {
+                    "name": "blue_audit",
+                    "description": "Check project health and find issues. Returns stalled work, missing ADRs, and recommendations.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory"
+                            }
+                        }
+                    }
+                },
+                {
+                    "name": "blue_rfc_complete",
+                    "description": "Mark RFC as implemented based on plan progress. Requires at least 70% completion.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory"
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "RFC title"
+                            }
+                        },
+                        "required": ["title"]
+                    }
+                },
+                {
+                    "name": "blue_worktree_cleanup",
+                    "description": "Clean up after PR merge. Removes worktree, deletes local branch, and provides commands to sync.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory"
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "RFC title"
+                            }
+                        },
+                        "required": ["title"]
+                    }
                 }
             ]
         }))
@@ -887,6 +936,10 @@ impl BlueServer {
             "blue_staging_unlock" => self.handle_staging_unlock(&call.arguments),
             "blue_staging_status" => self.handle_staging_status(&call.arguments),
             "blue_staging_cleanup" => self.handle_staging_cleanup(&call.arguments),
+            // Phase 6: Audit and completion handlers
+            "blue_audit" => self.handle_audit(&call.arguments),
+            "blue_rfc_complete" => self.handle_rfc_complete(&call.arguments),
+            "blue_worktree_cleanup" => self.handle_worktree_cleanup(&call.arguments),
             _ => Err(ServerError::ToolNotFound(call.name)),
         }?;
 
@@ -1421,6 +1474,25 @@ impl BlueServer {
         let args = args.as_ref().unwrap_or(&empty);
         let state = self.ensure_state()?;
         crate::handlers::staging::handle_cleanup(state, args)
+    }
+
+    // Phase 6: Audit and completion handlers
+
+    fn handle_audit(&mut self, _args: &Option<Value>) -> Result<Value, ServerError> {
+        let state = self.ensure_state()?;
+        crate::handlers::audit::handle_audit(state)
+    }
+
+    fn handle_rfc_complete(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        let state = self.ensure_state()?;
+        crate::handlers::rfc::handle_complete(state, args)
+    }
+
+    fn handle_worktree_cleanup(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        let state = self.ensure_state()?;
+        crate::handlers::worktree::handle_cleanup(state, args)
     }
 }
 

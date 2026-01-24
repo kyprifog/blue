@@ -136,6 +136,104 @@ pub fn handle_list(state: &ProjectState) -> Result<Value, ServerError> {
     }))
 }
 
+/// Handle blue_worktree_cleanup
+///
+/// Full cleanup after PR merge:
+/// 1. Verify PR is merged
+/// 2. Remove worktree
+/// 3. Delete local branch
+/// 4. Return commands for switching to develop
+pub fn handle_cleanup(state: &ProjectState, args: &Value) -> Result<Value, ServerError> {
+    let title = args
+        .get("title")
+        .and_then(|v| v.as_str())
+        .ok_or(ServerError::InvalidParams)?;
+
+    let branch_name = format!("rfc/{}", title);
+
+    // Find the RFC to get worktree info
+    let doc = state
+        .store
+        .find_document(DocType::Rfc, title)
+        .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
+
+    let doc_id = doc.id.ok_or(ServerError::InvalidParams)?;
+
+    // Get worktree info
+    let worktree = state.store.get_worktree(doc_id).ok().flatten();
+
+    // Try to open the repository
+    let repo_path = state.home.repos_path.join(&state.project);
+    let repo = match git2::Repository::open(&repo_path) {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(json!({
+                "status": "error",
+                "message": blue_core::voice::error(
+                    &format!("Couldn't open repository: {}", e),
+                    "Make sure you're in a git repository"
+                )
+            }));
+        }
+    };
+
+    // Check if branch is merged
+    let is_merged = blue_core::repo::is_branch_merged(&repo, &branch_name, "develop")
+        .or_else(|_| blue_core::repo::is_branch_merged(&repo, &branch_name, "main"))
+        .unwrap_or(false);
+
+    if !is_merged {
+        return Ok(json!({
+            "status": "error",
+            "message": blue_core::voice::error(
+                "PR doesn't appear to be merged yet",
+                "Complete the merge first with blue_pr_merge"
+            )
+        }));
+    }
+
+    // Remove worktree from git
+    let worktree_removed = if worktree.is_some() {
+        blue_core::repo::remove_worktree(&repo, &branch_name).is_ok()
+    } else {
+        false
+    };
+
+    // Delete local branch
+    let branch_deleted = if let Ok(mut branch) = repo.find_branch(&branch_name, git2::BranchType::Local) {
+        branch.delete().is_ok()
+    } else {
+        false
+    };
+
+    // Remove from store
+    if worktree.is_some() {
+        let _ = state.store.remove_worktree(doc_id);
+    }
+
+    let hint = format!(
+        "Worktree {}removed, branch {}deleted. Run the commands to complete cleanup.",
+        if worktree_removed { "" } else { "not " },
+        if branch_deleted { "" } else { "not " }
+    );
+
+    Ok(json!({
+        "status": "success",
+        "title": title,
+        "worktree_removed": worktree_removed,
+        "branch_deleted": branch_deleted,
+        "message": blue_core::voice::success(
+            &format!("Cleaned up after '{}'", title),
+            Some(&hint)
+        ),
+        "commands": [
+            "git checkout develop",
+            "git pull"
+        ],
+        "next_action": "Execute the commands to sync with develop"
+    }))
+}
+
 /// Handle blue_worktree_remove
 pub fn handle_remove(state: &ProjectState, args: &Value) -> Result<Value, ServerError> {
     let title = args

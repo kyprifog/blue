@@ -241,11 +241,22 @@ blue/
 - [x] Blue's voice in all error messages
 - [x] 24 tests passing
 
-### Phase 6: Pending (Future)
+### Phase 6: Audit and Completion - COMPLETE
+
+- [x] handlers/audit.rs - Project health check with issues and recommendations
+- [x] handlers/rfc.rs - RFC completion with progress validation
+- [x] handlers/worktree.rs - Added cleanup handler for post-merge workflow
+- [x] 3 new MCP tools: blue_audit, blue_rfc_complete, blue_worktree_cleanup
+- [x] Total: 35 MCP tools
+- [x] Blue's voice in all error messages
+- [x] 28 tests passing
+
+### Phase 7: Pending (Future)
 
 Remaining tools to port (if needed):
 - Code search/indexing (requires tree-sitter)
 - IaC detection and staging deployment tracking
+- PRD tools (5): create, get, approve, complete, list
 
 ## Test Plan
 
