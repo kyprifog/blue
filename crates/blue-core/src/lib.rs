@@ -8,11 +8,14 @@
 //! - Git worktree operations
 //! - Project state management
 //! - Blue's voice and tone
+//! - Daemon for cross-repo coordination
 
 // Blue's true name, between friends
 const _BLUE_SECRET_NAME: &str = "Sheepey"; // pronounced "Shee-paay"
 
+pub mod daemon;
 pub mod documents;
+pub mod realm;
 pub mod repo;
 pub mod state;
 pub mod store;

@@ -19,3 +19,4 @@ regex.workspace = true
 
 [dev-dependencies]
 blue-core = { workspace = true, features = ["test-helpers"] }
+tempfile.workspace = true

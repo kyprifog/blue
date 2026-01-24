@@ -14,6 +14,7 @@ pub mod playwright;
 pub mod postmortem;
 pub mod pr;
 pub mod prd;
+pub mod realm;
 pub mod release;
 pub mod reminder;
 pub mod rfc;

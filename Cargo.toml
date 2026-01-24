@@ -17,6 +17,7 @@ authors = ["Eric Minton Garcia"]
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_yaml = "0.9"
 
 # Async runtime
 tokio = { version = "1.0", features = ["full", "io-std"] }
@@ -43,6 +44,26 @@ git2 = "0.19"
 
 # Regex
 regex = "1.10"
+
+# Semver
+semver = { version = "1.0", features = ["serde"] }
+
+# HTTP server (daemon)
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# HTTP client (Forgejo API)
+reqwest = { version = "0.12", features = ["json"] }
+
+# Directories
+dirs = "5.0"
+
+# Testing HTTP services
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+# Testing
+tempfile = "3.15"
 
 # Internal
 blue-core = { path = "crates/blue-core" }

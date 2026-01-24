@@ -2,8 +2,10 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | Accepted |
 | **Created** | 2026-01-24 |
+| **Implemented** | 2026-01-24 |
+| **CLI Docs** | [docs/cli/realm.md](../cli/realm.md) |
 | **Source** | [Spike: cross-repo-coordination](../spikes/cross-repo-coordination.md) |
 | **Dialogue** | [cross-repo-realms.dialogue.md](../dialogues/cross-repo-realms.dialogue.md) |
 | **Refinement** | [cross-repo-realms-refinement.dialogue.md](../dialogues/cross-repo-realms-refinement.dialogue.md) |
@@ -42,8 +44,8 @@ When aperture adds a new S3 path, fungal's IAM policy must update. Currently:
 ### Hierarchy
 
 ```
-Index (~/.blue/index.yaml)
-  └── Realm (git repo)
+Daemon (per-machine)
+  └── Realm (git repo in Forgejo)
         └── Domain (coordination context)
               ├── Repo A (participant)
               └── Repo B (participant)
@@ -51,10 +53,10 @@ Index (~/.blue/index.yaml)
 
 | Level | Purpose | Storage |
 |-------|---------|---------|
-| **Index** | List of realms user participates in | `~/.blue/index.yaml` |
-| **Realm** | Groups related coordination domains | Git repository |
+| **Daemon** | Manages realms, sessions, notifications | `~/.blue/daemon.db` |
+| **Realm** | Groups related coordination domains | Git repo in Forgejo, cloned to `~/.blue/realms/` |
 | **Domain** | Coordination context between repos | Directory in realm repo |
-| **Repo** | Actual code repository (can participate in multiple domains) | `.blue/` directory |
+| **Repo** | Actual code repository (can participate in multiple domains) | `.blue/config.yaml` declares membership |
 
 **Key insight:** A domain is the *relationship* (edge), not the *thing* (node). Repos are nodes; domains are edges connecting them.
 
@@ -91,17 +93,56 @@ Note: `fungal` participates in both domains with different roles.
 
 ## Architecture
 
+### Daemon
+
+Blue runs as a per-machine daemon that manages realm state, git operations, and session coordination.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Blue Daemon                             │
+│                                                              │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
+│  │ HTTP Server  │  │ Git Manager  │  │ Session Mgr  │      │
+│  │ localhost:   │  │ (git2 crate) │  │              │      │
+│  │ 7865         │  │              │  │              │      │
+│  └──────────────┘  └──────────────┘  └──────────────┘      │
+│         │                 │                 │                │
+│         └─────────────────┼─────────────────┘                │
+│                           │                                  │
+│                    ┌──────┴──────┐                          │
+│                    │ daemon.db   │                          │
+│                    │ (SQLite)    │                          │
+│                    └─────────────┘                          │
+└─────────────────────────────────────────────────────────────┘
+          ▲                              ▲
+          │ HTTP                         │ HTTP
+          │                              │
+    ┌─────┴─────┐                 ┌──────┴──────┐
+    │ blue CLI  │                 │ Blue GUI    │
+    │           │                 │ (future)    │
+    └───────────┘                 └─────────────┘
+```
+
+**Key properties:**
+- Runs as system service (launchd/systemd)
+- Auto-starts on first CLI invocation
+- HTTP API on `localhost:7865` (GUI-friendly)
+- All git operations via `git2` crate (no subprocess)
+- Single-user assumption (multi-user is future work)
+
 ### Directory Structure
 
 ```
 ~/.blue/
-├── index.yaml                    # Realms this user participates in
+├── daemon.db                     # Daemon state (realms, sessions, notifications)
+├── realms/                       # Managed realm repo clones
+│   └── {realm-name}/             # Cloned from Forgejo
 └── credentials.yaml              # Optional, prefer git credentials
 
-$XDG_RUNTIME_DIR/blue/
-└── sessions.db                   # Session coordination (SQLite)
+/var/run/blue/                    # Or $XDG_RUNTIME_DIR/blue/ on Linux
+└── blue.pid                      # Daemon PID file
 
-realm-{name}/                     # Git repository
+realm-{name}/                     # Git repository (in Forgejo)
 ├── realm.yaml                    # Metadata, governance, trust
 ├── repos/
 │   └── {repo}.yaml               # Registered repos
@@ -115,7 +156,7 @@ realm-{name}/                     # Git repository
             └── {repo}.yaml       # Export/import declarations
 
 {repo}/.blue/
-├── config.yaml                   # Realm membership, domains
+├── config.yaml                   # Realm membership (name + Forgejo URL)
 └── cache.db                      # SQLite cache for exports, contracts
 ```
 
@@ -250,7 +291,7 @@ role: consumer
 
 imports:
   - contract: s3-permissions
-    version: ">=1.0.0 <2.0.0"  # Semver range
+    version: ">=1.0.0, <2.0.0"  # Semver range
     binding: cdk/training_tools_access_stack.py
     status: current
     resolved_version: "1.4.0"
@@ -263,16 +304,15 @@ imports:
 # aperture/.blue/config.yaml
 realm:
   name: letemcook
-  path: ../realm-letemcook
+  url: https://git.example.com/realms/letemcook.git
 
 repo: aperture
 
-domains:
-  - name: s3-access
-    role: provider
-    contracts:
-      - s3-permissions
+# Domains and contracts are defined in the realm repo (single source of truth).
+# This config just declares membership. The daemon resolves the rest.
 ```
+
+The realm repo is authoritative for what repos exist and their roles. Local config only declares "I belong to realm X at URL Y." The daemon clones and manages the realm repo automatically.
 
 ---
 
@@ -280,45 +320,53 @@ domains:
 
 Blue uses a **hybrid coordination model**:
 
-1. **Real-time hints (SQLite IPC):** Fast, best-effort session awareness
+1. **Real-time awareness (Daemon):** Fast session tracking and notifications
 2. **Durable changes (Git PRs):** Source of truth, auditable, PR-based
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                    Coordination Layers                        │
 ├──────────────────────────────────────────────────────────────┤
-│  Real-time Hints (SQLite)                                     │
-│  ┌─────────────┐     sessions.db     ┌─────────────┐         │
-│  │ Session A   │◄───────────────────►│ Session B   │         │
-│  │ (aperture)  │    notifications    │ (fungal)    │         │
-│  └─────────────┘                     └─────────────┘         │
+│  Real-time Awareness (Daemon)                                 │
+│  ┌─────────────┐                     ┌─────────────┐         │
+│  │ CLI/GUI A   │◄───────────────────►│ CLI/GUI B   │         │
+│  │ (aperture)  │    Blue Daemon      │ (fungal)    │         │
+│  └─────────────┘    localhost:7865   └─────────────┘         │
 │                                                               │
-│  Best-effort, sub-second latency, auto-cleanup               │
+│  Instant notifications, session tracking, auto-cleanup       │
 ├──────────────────────────────────────────────────────────────┤
-│  Durable Changes (Git)                                        │
+│  Durable Changes (Git via Forgejo)                           │
 │  ┌─────────────┐                     ┌─────────────┐         │
 │  │ Repo        │────sync branch─────►│ Realm Repo  │         │
-│  │             │◄───PR review────────│             │         │
+│  │             │◄───PR review────────│ (Forgejo)   │         │
 │  └─────────────┘                     └─────────────┘         │
 │                                                               │
 │  Source of truth, PR-based, auditable                        │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-### Session Coordination (SQLite)
+### Session Coordination (Daemon-Managed)
 
-Sessions register in a shared SQLite database for real-time awareness:
+The daemon manages sessions and notifications in `~/.blue/daemon.db`:
 
 ```sql
--- $XDG_RUNTIME_DIR/blue/sessions.db
+-- ~/.blue/daemon.db
+
+CREATE TABLE realms (
+    name TEXT PRIMARY KEY,
+    forgejo_url TEXT NOT NULL,
+    local_path TEXT NOT NULL,
+    last_sync TEXT,
+    status TEXT DEFAULT 'active'
+);
 
 CREATE TABLE sessions (
     id TEXT PRIMARY KEY,
     repo TEXT NOT NULL,
     realm TEXT NOT NULL,
-    pid INTEGER,
+    client_id TEXT,           -- CLI instance or GUI window
     started_at TEXT,
-    last_heartbeat TEXT,
+    last_activity TEXT,
     active_rfc TEXT,
     active_domains JSON DEFAULT '[]',
     exports_modified JSON DEFAULT '[]',
@@ -338,10 +386,29 @@ CREATE TABLE notifications (
 );
 ```
 
-**Heartbeat protocol:**
-- Sessions update `last_heartbeat` every 10 seconds
-- Stale sessions (>30s) are automatically cleaned up
-- Crash recovery on startup cleans orphaned sessions
+**Session lifecycle:**
+- CLI registers session on command start, deregisters on exit
+- Daemon tracks activity via API calls (no heartbeat polling needed)
+- Orphaned sessions cleaned on daemon restart
+- GUI clients maintain persistent sessions
+
+### Daemon API
+
+The daemon exposes an HTTP API on `localhost:7865`:
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/health` | GET | Daemon health check |
+| `/realms` | GET | List tracked realms |
+| `/realms/{name}` | GET | Realm details, domains, repos |
+| `/realms/{name}/sync` | POST | Trigger sync for realm |
+| `/sessions` | GET | List active sessions |
+| `/sessions` | POST | Register new session |
+| `/sessions/{id}` | DELETE | Deregister session |
+| `/notifications` | GET | List pending notifications |
+| `/notifications/{id}/ack` | POST | Acknowledge notification |
+
+**Auto-start:** If CLI calls daemon and it's not running, CLI spawns daemon as background process before proceeding.
 
 ### Sync Protocol (Git PRs)
 
@@ -502,7 +569,7 @@ blue realm admin cache stats  # Show cache hit rates
 
 ## CI/CD Integration
 
-### GitHub Actions Example
+### Forgejo Actions Example
 
 ```yaml
 name: Realm Contract Check
@@ -532,9 +599,11 @@ jobs:
           BLUE_REALM_TOKEN: ${{ secrets.REALM_TOKEN }}
 
       - name: Check compatibility
-        if: github.event_name == 'pull_request'
+        if: gitea.event_name == 'pull_request'
         run: blue realm check --mode=compatibility
 ```
+
+**Note:** Forgejo Actions uses `gitea.*` context variables. The workflow syntax is otherwise compatible with GitHub Actions.
 
 ### Validation Hooks
 
@@ -561,21 +630,22 @@ Blue uses a layered credential approach:
 
 ```
 Priority order (first found wins):
-1. Environment: BLUE_REALM_TOKEN, BLUE_GITHUB_TOKEN
+1. Environment: BLUE_REALM_TOKEN, BLUE_FORGEJO_TOKEN
 2. Git credential helper: git credential fill
 3. Keychain: macOS Keychain, Linux secret-service
 4. Config file: ~/.blue/credentials.yaml (discouraged)
 ```
 
-**For CI, GitHub App auth is supported:**
+**For CI with Forgejo:**
 ```yaml
 env:
-  BLUE_GITHUB_APP_ID: 12345
-  BLUE_GITHUB_APP_PRIVATE_KEY: ${{ secrets.APP_KEY }}
-  BLUE_GITHUB_APP_INSTALLATION_ID: 67890
+  BLUE_FORGEJO_URL: https://git.example.com
+  BLUE_FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
 ```
 
 **Default behavior:** Uses existing git credentials. No additional setup for basic usage.
+
+**Note:** GitHub/GitLab support is future work. MVP targets Forgejo only.
 
 ---
 
@@ -628,17 +698,20 @@ Detection uses topological sort on the domain dependency graph.
 ### Initial Setup
 
 ```bash
-# 1. Create realm (one-time)
-$ blue realm admin init --name letemcook
+# 1. Create realm (one-time, creates repo in Forgejo)
+$ blue realm admin init --name letemcook --forgejo https://git.example.com
+Starting daemon...
+✓ Daemon running on localhost:7865
+✓ Created realm repo in Forgejo: git.example.com/realms/letemcook
+✓ Cloned to ~/.blue/realms/letemcook/
 ✓ Created realm.yaml
-✓ Initialized git repository
 
 # 2. Register aperture in realm
 $ cd aperture
-$ blue realm admin join ../realm-letemcook
-✓ Created repos/aperture.yaml
-✓ Auto-detected exports: s3-permissions
-✓ Updated .blue/config.yaml
+$ blue realm admin join letemcook
+✓ Created repos/aperture.yaml in realm
+✓ Created .blue/config.yaml locally
+✓ Pushed to Forgejo
 
 # 3. Create the s3-access domain
 $ blue realm admin domain create s3-access \
@@ -648,13 +721,15 @@ $ blue realm admin domain create s3-access \
 ✓ Created domains/s3-access/contracts/s3-permissions.yaml
 ✓ Created domains/s3-access/bindings/aperture.yaml (provider)
 ✓ Created domains/s3-access/bindings/fungal-image-analysis.yaml (consumer)
+✓ Pushed to Forgejo
 
 # 4. Register fungal in realm
 $ cd ../fungal-image-analysis
-$ blue realm admin join ../realm-letemcook
-✓ Created repos/fungal-image-analysis.yaml
+$ blue realm admin join letemcook
+✓ Created repos/fungal-image-analysis.yaml in realm
 ✓ Detected import: s3-permissions in domain s3-access
-✓ Updated .blue/config.yaml
+✓ Created .blue/config.yaml locally
+✓ Pushed to Forgejo
 ```
 
 ### Daily Development
@@ -751,16 +826,24 @@ Merge order: aperture#45 → fungal#23
 
 | Phase | Scope |
 |-------|-------|
-| 0 | Data model + SQLite schemas |
-| 1 | `blue realm admin init/join` |
-| 2 | `blue realm status` with realm info |
-| 3 | `blue realm sync` with PR workflow |
-| 4 | `blue realm check` for CI |
-| 5 | Session coordination (SQLite IPC) |
-| 6 | `blue realm worktree` |
-| 7 | `blue realm pr` |
-| 8 | Caching layer |
-| 9 | Polish + docs |
+| 0 | Daemon infrastructure (HTTP server, auto-start, git2 integration) |
+| 1 | Data model + SQLite schemas |
+| 2 | `blue realm admin init/join` (creates realm in Forgejo, manages clones) |
+| 3 | `blue realm status` with realm info |
+| 4 | `blue realm sync` with PR workflow |
+| 5 | `blue realm check` for CI |
+| 6 | Session coordination (daemon-managed) |
+| 7 | `blue realm worktree` |
+| 8 | `blue realm pr` |
+| 9 | Caching layer |
+| 10 | Polish + docs |
+
+### Dependencies
+
+- **git2** crate for all git operations
+- **axum** or **actix-web** for daemon HTTP server
+- **rusqlite** for daemon.db and cache.db
+- **reqwest** for Forgejo API calls
 
 ### Phase 0: Data Model
 
@@ -846,10 +929,19 @@ pub struct ImportBinding {
 - [ ] `blue realm check --mode=compatibility` detects breaking changes
 - [ ] Validation hooks run with correct exit codes
 
+### Daemon
+- [ ] Daemon starts on first CLI invocation if not running
+- [ ] Daemon responds on `localhost:7865`
+- [ ] Daemon creates `~/.blue/daemon.db` on first start
+- [ ] Daemon clones realm repos to `~/.blue/realms/`
+- [ ] Daemon PID file created in `/var/run/blue/` or `$XDG_RUNTIME_DIR/blue/`
+- [ ] Daemon graceful shutdown cleans up resources
+- [ ] CLI commands fail gracefully if daemon unreachable
+
 ### Session Coordination
-- [ ] SQLite sessions.db created on Blue start
-- [ ] Session registered with heartbeat
-- [ ] Stale sessions cleaned up after 30s
+- [ ] Session registered on CLI command start
+- [ ] Session deregistered on CLI command exit
+- [ ] Orphaned sessions cleaned on daemon restart
 - [ ] Contract changes create notifications
 - [ ] Notifications visible in `blue realm status`
 
@@ -874,12 +966,16 @@ pub struct ImportBinding {
 
 ## Future Work
 
-1. **Signature verification** - Repos sign their exports
-2. **Multiple realms** - One repo participates in multiple realms
-3. **Cross-realm imports** - Import from domain in different realm
-4. **Public registry** - Discover realms and contracts
-5. **Infrastructure verification** - Check actual AWS state matches contracts
-6. **Domain-level governance** - Override realm governance per domain
+1. **Desktop GUI** - Native app for realm management and notifications
+2. **Sophisticated contract detection** - Parse Python/TypeScript/etc. to auto-detect exports (tree-sitter)
+3. **Signature verification** - Repos sign their exports
+4. **Multiple realms** - One repo participates in multiple realms
+5. **Cross-realm imports** - Import from domain in different realm
+6. **Public registry** - Discover realms and contracts
+7. **Infrastructure verification** - Check actual AWS state matches contracts
+8. **Domain-level governance** - Override realm governance per domain
+9. **GitHub/GitLab support** - Alternative to Forgejo for external users
+10. **Multi-user daemon** - Support multiple users on shared machines
 
 ---
 

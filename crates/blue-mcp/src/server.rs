@@ -1353,6 +1353,61 @@ impl BlueServer {
                         },
                         "required": ["title"]
                     }
+                },
+                // Phase 10: Realm tools (RFC 0002)
+                {
+                    "name": "realm_status",
+                    "description": "Get realm overview including repos, domains, contracts, and bindings. Returns pending notifications.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory (must be in a realm repo)"
+                            }
+                        },
+                        "required": ["cwd"]
+                    }
+                },
+                {
+                    "name": "realm_check",
+                    "description": "Validate realm contracts and bindings. Returns errors and warnings including schema-without-version changes.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory (must be in a realm repo)"
+                            },
+                            "realm": {
+                                "type": "string",
+                                "description": "Specific realm to check (defaults to current repo's realm)"
+                            }
+                        },
+                        "required": ["cwd"]
+                    }
+                },
+                {
+                    "name": "contract_get",
+                    "description": "Get contract details including schema, value, version, owner, and bindings.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory (must be in a realm repo)"
+                            },
+                            "domain": {
+                                "type": "string",
+                                "description": "Domain name containing the contract"
+                            },
+                            "contract": {
+                                "type": "string",
+                                "description": "Contract name"
+                            }
+                        },
+                        "required": ["cwd", "domain", "contract"]
+                    }
                 }
             ]
         }))
@@ -1442,6 +1497,10 @@ impl BlueServer {
             // Phase 9: Runbook handlers
             "blue_runbook_create" => self.handle_runbook_create(&call.arguments),
             "blue_runbook_update" => self.handle_runbook_update(&call.arguments),
+            // Phase 10: Realm tools (RFC 0002)
+            "realm_status" => self.handle_realm_status(&call.arguments),
+            "realm_check" => self.handle_realm_check(&call.arguments),
+            "contract_get" => self.handle_contract_get(&call.arguments),
             _ => Err(ServerError::ToolNotFound(call.name)),
         }?;
 
@@ -2137,6 +2196,33 @@ impl BlueServer {
         let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
         let state = self.ensure_state_mut()?;
         crate::handlers::runbook::handle_update(state, args)
+    }
+
+    // Phase 10: Realm handlers (RFC 0002)
+
+    fn handle_realm_status(&mut self, _args: &Option<Value>) -> Result<Value, ServerError> {
+        crate::handlers::realm::handle_status(self.cwd.as_deref())
+    }
+
+    fn handle_realm_check(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let realm = args
+            .as_ref()
+            .and_then(|a| a.get("realm"))
+            .and_then(|v| v.as_str());
+        crate::handlers::realm::handle_check(self.cwd.as_deref(), realm)
+    }
+
+    fn handle_contract_get(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        let domain = args
+            .get("domain")
+            .and_then(|v| v.as_str())
+            .ok_or(ServerError::InvalidParams)?;
+        let contract = args
+            .get("contract")
+            .and_then(|v| v.as_str())
+            .ok_or(ServerError::InvalidParams)?;
+        crate::handlers::realm::handle_contract_get(self.cwd.as_deref(), domain, contract)
     }
 }
 
