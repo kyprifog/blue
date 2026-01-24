@@ -359,6 +359,79 @@ pub fn handle_cost(args: &Value, repo_path: &std::path::Path) -> Result<Value, S
     }))
 }
 
+/// Handle blue_staging_deployments
+///
+/// Lists staging deployments with optional filtering.
+/// Can also check for expired deployments that need cleanup.
+pub fn handle_deployments(state: &ProjectState, args: &Value) -> Result<Value, ServerError> {
+    let status = args.get("status").and_then(|v| v.as_str());
+    let check_expired = args
+        .get("check_expired")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Check for expired deployments if requested
+    let expired = if check_expired {
+        state
+            .store
+            .mark_expired_deployments()
+            .map_err(|e| ServerError::CommandFailed(e.to_string()))?
+    } else {
+        vec![]
+    };
+
+    // List deployments with optional status filter
+    let deployments = state
+        .store
+        .list_staging_deployments(status)
+        .map_err(|e| ServerError::CommandFailed(e.to_string()))?;
+
+    let deployed_count = deployments
+        .iter()
+        .filter(|d| d.status == "deployed")
+        .count();
+    let expired_count = expired.len();
+
+    let hint = if check_expired && expired_count > 0 {
+        format!(
+            "{} staging deployment(s). {} newly expired and marked for cleanup.",
+            deployments.len(),
+            expired_count
+        )
+    } else {
+        format!(
+            "{} staging deployment(s) ({} active).",
+            deployments.len(),
+            deployed_count
+        )
+    };
+
+    Ok(json!({
+        "status": "success",
+        "message": blue_core::voice::info(
+            &format!("{} staging deployment{}", deployments.len(), if deployments.len() == 1 { "" } else { "s" }),
+            Some(&hint)
+        ),
+        "deployments": deployments.iter().map(|d| json!({
+            "name": d.name,
+            "iac_type": d.iac_type,
+            "deploy_command": d.deploy_command,
+            "stacks": d.stacks,
+            "deployed_by": d.deployed_by,
+            "deployed_at": d.deployed_at,
+            "ttl_expires_at": d.ttl_expires_at,
+            "status": d.status,
+            "destroyed_at": d.destroyed_at,
+        })).collect::<Vec<_>>(),
+        "expired_count": expired_count,
+        "newly_expired": expired.iter().map(|d| json!({
+            "name": d.name,
+            "iac_type": d.iac_type,
+            "ttl_expires_at": d.ttl_expires_at,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
 fn detect_cdk_stacks(path: &std::path::Path) -> Vec<String> {
     let mut stacks = Vec::new();
 

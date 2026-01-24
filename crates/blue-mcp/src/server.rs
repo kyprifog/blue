@@ -850,6 +850,28 @@ impl BlueServer {
                     }
                 },
                 {
+                    "name": "blue_staging_deployments",
+                    "description": "List staging environment deployments. Shows deployed, destroyed, or expired environments. Use check_expired=true to mark expired deployments.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory"
+                            },
+                            "status": {
+                                "type": "string",
+                                "enum": ["deployed", "destroyed", "expired"],
+                                "description": "Filter by deployment status"
+                            },
+                            "check_expired": {
+                                "type": "boolean",
+                                "description": "Check for and mark expired deployments (default: false)"
+                            }
+                        }
+                    }
+                },
+                {
                     "name": "blue_audit",
                     "description": "Check project health and find issues. Returns stalled work, missing ADRs, and recommendations.",
                     "inputSchema": {
@@ -1387,6 +1409,7 @@ impl BlueServer {
             "blue_staging_unlock" => self.handle_staging_unlock(&call.arguments),
             "blue_staging_status" => self.handle_staging_status(&call.arguments),
             "blue_staging_cleanup" => self.handle_staging_cleanup(&call.arguments),
+            "blue_staging_deployments" => self.handle_staging_deployments(&call.arguments),
             // Phase 6: Audit and completion handlers
             "blue_audit" => self.handle_audit(&call.arguments),
             "blue_rfc_complete" => self.handle_rfc_complete(&call.arguments),
@@ -1953,6 +1976,13 @@ impl BlueServer {
         let args = args.as_ref().unwrap_or(&empty);
         let state = self.ensure_state()?;
         crate::handlers::staging::handle_cleanup(state, args)
+    }
+
+    fn handle_staging_deployments(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let empty = json!({});
+        let args = args.as_ref().unwrap_or(&empty);
+        let state = self.ensure_state()?;
+        crate::handlers::staging::handle_deployments(state, args)
     }
 
     // Phase 6: Audit and completion handlers

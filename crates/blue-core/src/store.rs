@@ -124,6 +124,24 @@ const SCHEMA: &str = r#"
 
     CREATE INDEX IF NOT EXISTS idx_staging_locks_resource ON staging_locks(resource);
     CREATE INDEX IF NOT EXISTS idx_staging_queue_resource ON staging_lock_queue(resource);
+
+    CREATE TABLE IF NOT EXISTS staging_deployments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        iac_type TEXT NOT NULL,
+        deploy_command TEXT NOT NULL,
+        stacks TEXT,
+        deployed_by TEXT NOT NULL,
+        agent_id TEXT,
+        deployed_at TEXT NOT NULL,
+        ttl_expires_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'deployed',
+        destroyed_at TEXT,
+        metadata TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_staging_deployments_status ON staging_deployments(status);
+    CREATE INDEX IF NOT EXISTS idx_staging_deployments_expires ON staging_deployments(ttl_expires_at);
 "#;
 
 /// FTS5 schema for full-text search
@@ -427,6 +445,45 @@ pub enum StagingLockResult {
         current_holder: String,
         expires_at: String,
     },
+}
+
+/// A tracked staging deployment with TTL
+#[derive(Debug, Clone)]
+pub struct StagingDeployment {
+    pub id: Option<i64>,
+    pub name: String,
+    pub iac_type: String,
+    pub deploy_command: String,
+    pub stacks: Option<String>,
+    pub deployed_by: String,
+    pub agent_id: Option<String>,
+    pub deployed_at: String,
+    pub ttl_expires_at: String,
+    pub status: String,
+    pub destroyed_at: Option<String>,
+    pub metadata: Option<String>,
+}
+
+/// Result of staging resource cleanup operation
+#[derive(Debug, Clone)]
+pub struct StagingCleanupResult {
+    /// Number of expired locks deleted
+    pub locks_cleaned: usize,
+    /// Number of orphaned queue entries deleted
+    pub queue_entries_cleaned: usize,
+    /// Number of deployments marked as expired
+    pub deployments_marked_expired: usize,
+    /// Deployments that are expired but not yet destroyed
+    pub expired_deployments_pending_destroy: Vec<ExpiredDeploymentInfo>,
+}
+
+/// Info about an expired deployment that needs to be destroyed
+#[derive(Debug, Clone)]
+pub struct ExpiredDeploymentInfo {
+    pub name: String,
+    pub iac_type: String,
+    pub deploy_command: String,
+    pub stacks: Option<String>,
 }
 
 /// Store errors - in Blue's voice
@@ -1638,6 +1695,227 @@ impl DocumentStore {
             )?;
 
             Ok((locks_cleaned, queue_cleaned))
+        })
+    }
+
+    // ===== Staging Deployments =====
+
+    /// Record a new staging deployment
+    pub fn record_staging_deployment(
+        &self,
+        name: &str,
+        iac_type: &str,
+        deploy_command: &str,
+        stacks: Option<&str>,
+        deployed_by: &str,
+        agent_id: Option<&str>,
+        ttl_hours: u32,
+        metadata: Option<&str>,
+    ) -> Result<StagingDeployment, StoreError> {
+        self.with_retry(|| {
+            let now = chrono::Utc::now();
+            let ttl_expires = now + chrono::Duration::hours(ttl_hours as i64);
+
+            self.conn.execute(
+                "INSERT OR REPLACE INTO staging_deployments
+                 (name, iac_type, deploy_command, stacks, deployed_by, agent_id, deployed_at, ttl_expires_at, status, metadata)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'deployed', ?9)",
+                params![
+                    name,
+                    iac_type,
+                    deploy_command,
+                    stacks,
+                    deployed_by,
+                    agent_id,
+                    now.to_rfc3339(),
+                    ttl_expires.to_rfc3339(),
+                    metadata
+                ],
+            )?;
+
+            Ok(StagingDeployment {
+                id: Some(self.conn.last_insert_rowid()),
+                name: name.to_string(),
+                iac_type: iac_type.to_string(),
+                deploy_command: deploy_command.to_string(),
+                stacks: stacks.map(|s| s.to_string()),
+                deployed_by: deployed_by.to_string(),
+                agent_id: agent_id.map(|s| s.to_string()),
+                deployed_at: now.to_rfc3339(),
+                ttl_expires_at: ttl_expires.to_rfc3339(),
+                status: "deployed".to_string(),
+                destroyed_at: None,
+                metadata: metadata.map(|s| s.to_string()),
+            })
+        })
+    }
+
+    /// List all staging deployments, optionally filtered by status
+    pub fn list_staging_deployments(
+        &self,
+        status: Option<&str>,
+    ) -> Result<Vec<StagingDeployment>, StoreError> {
+        let query = if status.is_some() {
+            "SELECT id, name, iac_type, deploy_command, stacks, deployed_by, agent_id,
+                    deployed_at, ttl_expires_at, status, destroyed_at, metadata
+             FROM staging_deployments WHERE status = ?1 ORDER BY deployed_at DESC"
+        } else {
+            "SELECT id, name, iac_type, deploy_command, stacks, deployed_by, agent_id,
+                    deployed_at, ttl_expires_at, status, destroyed_at, metadata
+             FROM staging_deployments ORDER BY deployed_at DESC"
+        };
+
+        let mut stmt = self.conn.prepare(query)?;
+
+        let rows = if let Some(s) = status {
+            stmt.query_map(params![s], Self::map_staging_deployment)?
+        } else {
+            stmt.query_map([], Self::map_staging_deployment)?
+        };
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::Database)
+    }
+
+    /// Get expired deployments that need cleanup
+    pub fn get_expired_deployments(&self) -> Result<Vec<StagingDeployment>, StoreError> {
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, iac_type, deploy_command, stacks, deployed_by, agent_id,
+                    deployed_at, ttl_expires_at, status, destroyed_at, metadata
+             FROM staging_deployments
+             WHERE status = 'deployed' AND ttl_expires_at < ?1
+             ORDER BY ttl_expires_at",
+        )?;
+
+        let rows = stmt.query_map(params![now], Self::map_staging_deployment)?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::Database)
+    }
+
+    /// Mark a deployment as destroyed
+    pub fn mark_deployment_destroyed(&self, name: &str) -> Result<(), StoreError> {
+        self.with_retry(|| {
+            let now = chrono::Utc::now().to_rfc3339();
+
+            let updated = self.conn.execute(
+                "UPDATE staging_deployments SET status = 'destroyed', destroyed_at = ?1
+                 WHERE name = ?2 AND status = 'deployed'",
+                params![now, name],
+            )?;
+
+            if updated == 0 {
+                return Err(StoreError::NotFound(format!(
+                    "Deployment '{}' not found or already destroyed",
+                    name
+                )));
+            }
+
+            Ok(())
+        })
+    }
+
+    /// Mark expired deployments as expired (for auto-cleanup tracking)
+    pub fn mark_expired_deployments(&self) -> Result<Vec<StagingDeployment>, StoreError> {
+        let expired = self.get_expired_deployments()?;
+
+        self.with_retry(|| {
+            let now = chrono::Utc::now().to_rfc3339();
+            self.conn.execute(
+                "UPDATE staging_deployments SET status = 'expired'
+                 WHERE status = 'deployed' AND ttl_expires_at < ?1",
+                params![now],
+            )?;
+            Ok(())
+        })?;
+
+        Ok(expired)
+    }
+
+    /// Get a specific deployment by name
+    pub fn get_staging_deployment(
+        &self,
+        name: &str,
+    ) -> Result<Option<StagingDeployment>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT id, name, iac_type, deploy_command, stacks, deployed_by, agent_id,
+                    deployed_at, ttl_expires_at, status, destroyed_at, metadata
+                 FROM staging_deployments WHERE name = ?1",
+                params![name],
+                Self::map_staging_deployment,
+            )
+            .optional()
+            .map_err(StoreError::Database)
+    }
+
+    /// Helper to map a row to StagingDeployment
+    fn map_staging_deployment(row: &rusqlite::Row) -> rusqlite::Result<StagingDeployment> {
+        Ok(StagingDeployment {
+            id: Some(row.get(0)?),
+            name: row.get(1)?,
+            iac_type: row.get(2)?,
+            deploy_command: row.get(3)?,
+            stacks: row.get(4)?,
+            deployed_by: row.get(5)?,
+            agent_id: row.get(6)?,
+            deployed_at: row.get(7)?,
+            ttl_expires_at: row.get(8)?,
+            status: row.get(9)?,
+            destroyed_at: row.get(10)?,
+            metadata: row.get(11)?,
+        })
+    }
+
+    /// Clean up all expired staging resources (locks, deployments, queue entries)
+    pub fn cleanup_expired_staging_resources(&self) -> Result<StagingCleanupResult, StoreError> {
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Clean up expired locks
+        let locks_cleaned = self.conn.execute(
+            "DELETE FROM staging_locks WHERE expires_at < ?1",
+            params![now],
+        )?;
+
+        // Clean up orphaned queue entries
+        let queue_cleaned = self.conn.execute(
+            "DELETE FROM staging_lock_queue
+             WHERE resource NOT IN (SELECT resource FROM staging_locks)",
+            [],
+        )?;
+
+        // Mark expired deployments
+        let deployments_marked = self.conn.execute(
+            "UPDATE staging_deployments SET status = 'expired'
+             WHERE status = 'deployed' AND ttl_expires_at < ?1",
+            params![now],
+        )?;
+
+        // Get list of expired deployments that need cleanup commands
+        let mut stmt = self.conn.prepare(
+            "SELECT name, iac_type, deploy_command, stacks
+             FROM staging_deployments
+             WHERE status = 'expired' AND destroyed_at IS NULL",
+        )?;
+
+        let expired_deployments: Vec<ExpiredDeploymentInfo> = stmt
+            .query_map([], |row| {
+                Ok(ExpiredDeploymentInfo {
+                    name: row.get(0)?,
+                    iac_type: row.get(1)?,
+                    deploy_command: row.get(2)?,
+                    stacks: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(StagingCleanupResult {
+            locks_cleaned,
+            queue_entries_cleaned: queue_cleaned,
+            deployments_marked_expired: deployments_marked,
+            expired_deployments_pending_destroy: expired_deployments,
         })
     }
 }
