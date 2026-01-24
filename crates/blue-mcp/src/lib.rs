@@ -4,6 +4,7 @@
 //! Implements JSON-RPC 2.0 over stdio.
 
 mod error;
+mod handlers;
 mod server;
 
 pub use error::ServerError;

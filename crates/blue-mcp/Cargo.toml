@@ -13,3 +13,5 @@ thiserror.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+chrono.workspace = true
+git2.workspace = true

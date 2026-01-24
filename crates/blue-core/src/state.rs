@@ -249,8 +249,6 @@ pub enum StateError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_generate_hint_empty() {
         // This would require setting up a full test environment

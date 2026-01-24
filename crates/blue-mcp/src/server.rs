@@ -297,6 +297,178 @@ impl BlueServer {
                         },
                         "required": ["query"]
                     }
+                },
+                {
+                    "name": "blue_spike_create",
+                    "description": "Start a time-boxed investigation.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory"
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "Investigation title"
+                            },
+                            "question": {
+                                "type": "string",
+                                "description": "What we're trying to learn"
+                            },
+                            "time_box": {
+                                "type": "string",
+                                "description": "Time limit (e.g., '2 hours')"
+                            }
+                        },
+                        "required": ["title", "question"]
+                    }
+                },
+                {
+                    "name": "blue_spike_complete",
+                    "description": "Complete an investigation with findings.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory"
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "Investigation title"
+                            },
+                            "outcome": {
+                                "type": "string",
+                                "description": "Investigation outcome",
+                                "enum": ["no-action", "decision-made", "recommends-implementation"]
+                            },
+                            "summary": {
+                                "type": "string",
+                                "description": "Summary of findings"
+                            }
+                        },
+                        "required": ["title", "outcome"]
+                    }
+                },
+                {
+                    "name": "blue_adr_create",
+                    "description": "Create an Architecture Decision Record.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory"
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "ADR title (kebab-case)"
+                            },
+                            "rfc": {
+                                "type": "string",
+                                "description": "RFC title this ADR documents (must be implemented)"
+                            },
+                            "context": {
+                                "type": "string",
+                                "description": "Decision context"
+                            },
+                            "decision": {
+                                "type": "string",
+                                "description": "The decision that was made"
+                            },
+                            "consequences": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Consequences of the decision"
+                            }
+                        },
+                        "required": ["title"]
+                    }
+                },
+                {
+                    "name": "blue_decision_create",
+                    "description": "Create a lightweight Decision Note.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory"
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "Decision title"
+                            },
+                            "decision": {
+                                "type": "string",
+                                "description": "The decision made"
+                            },
+                            "rationale": {
+                                "type": "string",
+                                "description": "Why this decision was made"
+                            },
+                            "alternatives": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Alternatives that were considered"
+                            }
+                        },
+                        "required": ["title", "decision"]
+                    }
+                },
+                {
+                    "name": "blue_worktree_create",
+                    "description": "Create an isolated git worktree for RFC implementation.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory"
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "RFC title to implement"
+                            }
+                        },
+                        "required": ["title"]
+                    }
+                },
+                {
+                    "name": "blue_worktree_list",
+                    "description": "List active git worktrees.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory"
+                            }
+                        }
+                    }
+                },
+                {
+                    "name": "blue_worktree_remove",
+                    "description": "Remove a worktree after PR merge.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory"
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "RFC title"
+                            },
+                            "force": {
+                                "type": "boolean",
+                                "description": "Remove even if branch not merged"
+                            }
+                        },
+                        "required": ["title"]
+                    }
                 }
             ]
         }))
@@ -326,6 +498,14 @@ impl BlueServer {
             "blue_rfc_task_complete" => self.handle_rfc_task_complete(&call.arguments),
             "blue_rfc_validate" => self.handle_rfc_validate(&call.arguments),
             "blue_search" => self.handle_search(&call.arguments),
+            // Phase 2: Workflow handlers
+            "blue_spike_create" => self.handle_spike_create(&call.arguments),
+            "blue_spike_complete" => self.handle_spike_complete(&call.arguments),
+            "blue_adr_create" => self.handle_adr_create(&call.arguments),
+            "blue_decision_create" => self.handle_decision_create(&call.arguments),
+            "blue_worktree_create" => self.handle_worktree_create(&call.arguments),
+            "blue_worktree_list" => self.handle_worktree_list(&call.arguments),
+            "blue_worktree_remove" => self.handle_worktree_remove(&call.arguments),
             _ => Err(ServerError::ToolNotFound(call.name)),
         }?;
 
@@ -711,6 +891,49 @@ impl BlueServer {
                 "score": r.score
             })).collect::<Vec<_>>()
         }))
+    }
+
+    // Phase 2: Workflow handlers
+
+    fn handle_spike_create(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        let state = self.ensure_state()?;
+        crate::handlers::spike::handle_create(state, args)
+    }
+
+    fn handle_spike_complete(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        let state = self.ensure_state()?;
+        crate::handlers::spike::handle_complete(state, args)
+    }
+
+    fn handle_adr_create(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        let state = self.ensure_state()?;
+        crate::handlers::adr::handle_create(state, args)
+    }
+
+    fn handle_decision_create(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        let state = self.ensure_state()?;
+        crate::handlers::decision::handle_create(state, args)
+    }
+
+    fn handle_worktree_create(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        let state = self.ensure_state()?;
+        crate::handlers::worktree::handle_create(state, args)
+    }
+
+    fn handle_worktree_list(&mut self, _args: &Option<Value>) -> Result<Value, ServerError> {
+        let state = self.ensure_state()?;
+        crate::handlers::worktree::handle_list(state)
+    }
+
+    fn handle_worktree_remove(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        let state = self.ensure_state()?;
+        crate::handlers::worktree::handle_remove(state, args)
     }
 }
 
