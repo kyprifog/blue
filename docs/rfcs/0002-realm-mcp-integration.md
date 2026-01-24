@@ -178,15 +178,16 @@ All tools return `next_steps` suggestions based on state:
 
 ## Implementation Phases
 
-### Phase 1: Core Tools
+### Phase 1: Core Tools ✓
 - `realm_status`, `realm_check`, `contract_get`
 - Context detection from cwd
-- Middleware for notification injection
+- Middleware for notification injection (deferred to Phase 4)
 
-### Phase 2: Session Tools
+### Phase 2: Session Tools ✓
 - `session_start`, `session_stop`
-- Session-scoped context
-- Notification lifecycle (pending → seen)
+- Session-scoped context via `.blue/session` file
+- Tracks active RFC, domains, contracts modified/watched
+- Daemon integration deferred to Phase 4
 
 ### Phase 3: Workflow Tools
 - `worktree_create` with domain peer selection
@@ -196,6 +197,7 @@ All tools return `next_steps` suggestions based on state:
 - `notifications_list` with state filters
 - Schema hash detection in `realm_check`
 - 7-day expiration cleanup
+- Daemon integration for session registration
 
 ---
 

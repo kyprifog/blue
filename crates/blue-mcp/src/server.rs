@@ -1408,6 +1408,39 @@ impl BlueServer {
                         },
                         "required": ["cwd", "domain", "contract"]
                     }
+                },
+                // Phase 2: Session tools (RFC 0002)
+                {
+                    "name": "session_start",
+                    "description": "Begin a work session. Tracks active realm, repo, domains, and contracts being modified or watched. Returns session ID and context.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory (must be in a realm repo)"
+                            },
+                            "active_rfc": {
+                                "type": "string",
+                                "description": "Optional RFC title being worked on"
+                            }
+                        },
+                        "required": ["cwd"]
+                    }
+                },
+                {
+                    "name": "session_stop",
+                    "description": "End the current work session. Returns summary including duration, domains touched, and contracts modified.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory (must be in a realm repo)"
+                            }
+                        },
+                        "required": ["cwd"]
+                    }
                 }
             ]
         }))
@@ -1501,6 +1534,8 @@ impl BlueServer {
             "realm_status" => self.handle_realm_status(&call.arguments),
             "realm_check" => self.handle_realm_check(&call.arguments),
             "contract_get" => self.handle_contract_get(&call.arguments),
+            "session_start" => self.handle_session_start(&call.arguments),
+            "session_stop" => self.handle_session_stop(&call.arguments),
             _ => Err(ServerError::ToolNotFound(call.name)),
         }?;
 
@@ -2223,6 +2258,20 @@ impl BlueServer {
             .and_then(|v| v.as_str())
             .ok_or(ServerError::InvalidParams)?;
         crate::handlers::realm::handle_contract_get(self.cwd.as_deref(), domain, contract)
+    }
+
+    // Phase 2: Session handlers (RFC 0002)
+
+    fn handle_session_start(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let active_rfc = args
+            .as_ref()
+            .and_then(|a| a.get("active_rfc"))
+            .and_then(|v| v.as_str());
+        crate::handlers::realm::handle_session_start(self.cwd.as_deref(), active_rfc)
+    }
+
+    fn handle_session_stop(&mut self, _args: &Option<Value>) -> Result<Value, ServerError> {
+        crate::handlers::realm::handle_session_stop(self.cwd.as_deref())
     }
 }
 

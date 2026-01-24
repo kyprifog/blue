@@ -1,12 +1,20 @@
 //! Realm MCP tool handlers
 //!
-//! Implements RFC 0002: Realm MCP Integration (Phase 1)
+//! Implements RFC 0002: Realm MCP Integration
+//!
+//! Phase 1:
 //! - realm_status: Get realm overview
 //! - realm_check: Validate contracts/bindings
 //! - contract_get: Get contract details
+//!
+//! Phase 2:
+//! - session_start: Begin work session
+//! - session_stop: End session with summary
 
 use blue_core::daemon::DaemonPaths;
 use blue_core::realm::{LocalRepoConfig, RealmService};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -290,6 +298,229 @@ pub fn handle_contract_get(
     }))
 }
 
+// ─── Phase 2: Session Tools ─────────────────────────────────────────────────
+
+/// Session state stored in .blue/session
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionState {
+    pub id: String,
+    pub realm: String,
+    pub repo: String,
+    pub started_at: DateTime<Utc>,
+    pub last_activity: DateTime<Utc>,
+    #[serde(default)]
+    pub active_rfc: Option<String>,
+    #[serde(default)]
+    pub active_domains: Vec<String>,
+    #[serde(default)]
+    pub contracts_modified: Vec<String>,
+    #[serde(default)]
+    pub contracts_watched: Vec<String>,
+}
+
+impl SessionState {
+    /// Load session from .blue/session file
+    pub fn load(cwd: &Path) -> Option<Self> {
+        let session_path = cwd.join(".blue").join("session");
+        if !session_path.exists() {
+            return None;
+        }
+
+        let content = std::fs::read_to_string(&session_path).ok()?;
+        serde_yaml::from_str(&content).ok()
+    }
+
+    /// Save session to .blue/session file
+    pub fn save(&self, cwd: &Path) -> Result<(), ServerError> {
+        let blue_dir = cwd.join(".blue");
+        if !blue_dir.exists() {
+            return Err(ServerError::NotFound(
+                "Not in a realm repo. No .blue directory.".to_string(),
+            ));
+        }
+
+        let session_path = blue_dir.join("session");
+        let content = serde_yaml::to_string(self)
+            .map_err(|e| ServerError::CommandFailed(format!("Failed to serialize session: {}", e)))?;
+
+        std::fs::write(&session_path, content)
+            .map_err(|e| ServerError::CommandFailed(format!("Failed to write session: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Delete session file
+    pub fn delete(cwd: &Path) -> Result<(), ServerError> {
+        let session_path = cwd.join(".blue").join("session");
+        if session_path.exists() {
+            std::fs::remove_file(&session_path).map_err(|e| {
+                ServerError::CommandFailed(format!("Failed to delete session: {}", e))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Generate a unique session ID
+fn generate_session_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!("sess-{:x}", timestamp)
+}
+
+/// Handle session_start - begin work session
+pub fn handle_session_start(
+    cwd: Option<&Path>,
+    active_rfc: Option<&str>,
+) -> Result<Value, ServerError> {
+    let cwd = cwd.ok_or(ServerError::InvalidParams)?;
+    let ctx = detect_context(Some(cwd))?;
+
+    // Check for existing session
+    if let Some(existing) = SessionState::load(cwd) {
+        return Ok(json!({
+            "status": "warning",
+            "message": "Session already active",
+            "session": {
+                "id": existing.id,
+                "realm": existing.realm,
+                "repo": existing.repo,
+                "started_at": existing.started_at.to_rfc3339(),
+                "active_rfc": existing.active_rfc,
+                "active_domains": existing.active_domains
+            },
+            "next_steps": ["Use session_stop to end the current session first"]
+        }));
+    }
+
+    // Determine active domains from repo's bindings
+    let details = ctx.service.load_realm_details(&ctx.realm_name).map_err(|e| {
+        ServerError::CommandFailed(format!("Failed to load realm: {}", e))
+    })?;
+
+    let active_domains: Vec<String> = details
+        .domains
+        .iter()
+        .filter(|d| d.bindings.iter().any(|b| b.repo == ctx.repo_name))
+        .map(|d| d.domain.name.clone())
+        .collect();
+
+    // Determine contracts we're watching (imports) and could modify (exports)
+    let mut contracts_watched = Vec::new();
+    let mut contracts_modified = Vec::new();
+
+    for domain in &details.domains {
+        for binding in &domain.bindings {
+            if binding.repo == ctx.repo_name {
+                for import in &binding.imports {
+                    contracts_watched.push(format!("{}/{}", domain.domain.name, import.contract));
+                }
+                for export in &binding.exports {
+                    contracts_modified.push(format!("{}/{}", domain.domain.name, export.contract));
+                }
+            }
+        }
+    }
+
+    let now = Utc::now();
+    let session = SessionState {
+        id: generate_session_id(),
+        realm: ctx.realm_name.clone(),
+        repo: ctx.repo_name.clone(),
+        started_at: now,
+        last_activity: now,
+        active_rfc: active_rfc.map(String::from),
+        active_domains: active_domains.clone(),
+        contracts_modified: contracts_modified.clone(),
+        contracts_watched: contracts_watched.clone(),
+    };
+
+    session.save(cwd)?;
+
+    // Build next steps
+    let mut next_steps = Vec::new();
+    if !contracts_watched.is_empty() {
+        next_steps.push(format!(
+            "Watching {} imported contract{}",
+            contracts_watched.len(),
+            if contracts_watched.len() == 1 { "" } else { "s" }
+        ));
+    }
+    if active_rfc.is_none() {
+        next_steps.push("Consider setting active_rfc to track which RFC you're working on".to_string());
+    }
+    next_steps.push("Use session_stop when done to get a summary".to_string());
+
+    Ok(json!({
+        "status": "success",
+        "message": "Session started",
+        "session": {
+            "id": session.id,
+            "realm": session.realm,
+            "repo": session.repo,
+            "started_at": session.started_at.to_rfc3339(),
+            "active_rfc": session.active_rfc,
+            "active_domains": session.active_domains,
+            "contracts_modified": contracts_modified,
+            "contracts_watched": contracts_watched
+        },
+        "notifications": [],
+        "next_steps": next_steps
+    }))
+}
+
+/// Handle session_stop - end session with summary
+pub fn handle_session_stop(cwd: Option<&Path>) -> Result<Value, ServerError> {
+    let cwd = cwd.ok_or(ServerError::InvalidParams)?;
+
+    // Load existing session
+    let session = SessionState::load(cwd).ok_or_else(|| {
+        ServerError::NotFound("No active session. Nothing to stop.".to_string())
+    })?;
+
+    // Calculate session duration
+    let duration = Utc::now().signed_duration_since(session.started_at);
+    let duration_str = if duration.num_hours() > 0 {
+        format!("{}h {}m", duration.num_hours(), duration.num_minutes() % 60)
+    } else if duration.num_minutes() > 0 {
+        format!("{}m", duration.num_minutes())
+    } else {
+        format!("{}s", duration.num_seconds())
+    };
+
+    // Delete the session file
+    SessionState::delete(cwd)?;
+
+    // Build summary
+    let summary = json!({
+        "id": session.id,
+        "realm": session.realm,
+        "repo": session.repo,
+        "started_at": session.started_at.to_rfc3339(),
+        "ended_at": Utc::now().to_rfc3339(),
+        "duration": duration_str,
+        "active_rfc": session.active_rfc,
+        "active_domains": session.active_domains,
+        "contracts_modified": session.contracts_modified,
+        "contracts_watched": session.contracts_watched
+    });
+
+    Ok(json!({
+        "status": "success",
+        "message": format!("Session ended after {}", duration_str),
+        "summary": summary,
+        "next_steps": ["Start a new session with session_start when you're ready to work again"]
+    }))
+}
+
+/// Get current session if one exists (for other tools to check)
+pub fn get_current_session(cwd: Option<&Path>) -> Option<SessionState> {
+    cwd.and_then(SessionState::load)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,5 +566,97 @@ repo: test-repo
                 // Also acceptable if daemon paths don't exist
             }
         }
+    }
+
+    // Phase 2: Session tests
+
+    #[test]
+    fn test_session_state_save_load() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let blue_dir = path.join(".blue");
+        std::fs::create_dir_all(&blue_dir).unwrap();
+
+        let session = SessionState {
+            id: "test-session-123".to_string(),
+            realm: "test-realm".to_string(),
+            repo: "test-repo".to_string(),
+            started_at: Utc::now(),
+            last_activity: Utc::now(),
+            active_rfc: Some("my-rfc".to_string()),
+            active_domains: vec!["domain-1".to_string()],
+            contracts_modified: vec!["domain-1/contract-a".to_string()],
+            contracts_watched: vec!["domain-1/contract-b".to_string()],
+        };
+
+        // Save
+        session.save(&path).unwrap();
+
+        // Verify file exists
+        assert!(blue_dir.join("session").exists());
+
+        // Load
+        let loaded = SessionState::load(&path).unwrap();
+        assert_eq!(loaded.id, "test-session-123");
+        assert_eq!(loaded.realm, "test-realm");
+        assert_eq!(loaded.repo, "test-repo");
+        assert_eq!(loaded.active_rfc, Some("my-rfc".to_string()));
+        assert_eq!(loaded.active_domains, vec!["domain-1".to_string()]);
+    }
+
+    #[test]
+    fn test_session_state_delete() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let blue_dir = path.join(".blue");
+        std::fs::create_dir_all(&blue_dir).unwrap();
+
+        // Create session file
+        let session = SessionState {
+            id: "to-delete".to_string(),
+            realm: "test-realm".to_string(),
+            repo: "test-repo".to_string(),
+            started_at: Utc::now(),
+            last_activity: Utc::now(),
+            active_rfc: None,
+            active_domains: vec![],
+            contracts_modified: vec![],
+            contracts_watched: vec![],
+        };
+        session.save(&path).unwrap();
+        assert!(blue_dir.join("session").exists());
+
+        // Delete
+        SessionState::delete(&path).unwrap();
+        assert!(!blue_dir.join("session").exists());
+    }
+
+    #[test]
+    fn test_session_state_load_nonexistent() {
+        let tmp = TempDir::new().unwrap();
+        let result = SessionState::load(tmp.path());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_generate_session_id() {
+        let id1 = generate_session_id();
+        let id2 = generate_session_id();
+
+        assert!(id1.starts_with("sess-"));
+        assert!(id2.starts_with("sess-"));
+        // IDs should be unique (different timestamps)
+        // Note: Could be same if generated within same millisecond
+    }
+
+    #[test]
+    fn test_session_stop_no_session() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let blue_dir = path.join(".blue");
+        std::fs::create_dir_all(&blue_dir).unwrap();
+
+        let result = handle_session_stop(Some(&path));
+        assert!(result.is_err());
     }
 }
