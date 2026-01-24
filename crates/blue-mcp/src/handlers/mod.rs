@@ -3,7 +3,8 @@
 //! Each module handles a specific document type or workflow.
 
 pub mod adr;
-pub mod audit;
+pub mod audit; // Health check (blue_health_check)
+pub mod audit_doc; // Audit documents (blue_audit_create, etc.)
 pub mod decision;
 pub mod delete;
 pub mod dialogue;

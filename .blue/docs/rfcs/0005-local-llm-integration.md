@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | Implemented |
 | **Date** | 2026-01-24 |
 | **Source Spike** | local-llm-integration, agentic-cli-integration |
 
@@ -307,53 +307,81 @@ blue_model_pull name="qwen2.5:7b"
 
 ### 5.1 Goose Integration
 
-Blue's embedded Ollama serves Goose for agentic coding:
+Blue bundles Goose binary and auto-configures it for local Ollama:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  User runs: goose                                        │
+│  User runs: blue agent                                   │
 │       ↓                                                  │
-│  Goose connects to localhost:11434 (Blue's Ollama)      │
+│  Blue detects Ollama on localhost:11434                 │
 │       ↓                                                  │
-│  Uses same model Blue uses for semantic tasks           │
+│  Picks largest available model (e.g., qwen2.5:72b)      │
+│       ↓                                                  │
+│  Launches bundled Goose with Blue MCP extension         │
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Setup:**
+**Zero Setup:**
 
 ```bash
-# 1. Start Blue (starts embedded Ollama)
-blue daemon start
-
-# 2. Configure Goose to use Blue's Ollama
-# ~/.config/goose/config.yaml
-provider: ollama
-model: qwen2.5-coder:32b
-host: http://localhost:11434
-
-# 3. Run Goose with Blue's MCP tools
-goose --extension "blue mcp"
-```
-
-**Convenience command:**
-
-```bash
-# Start Goose with Blue pre-configured
+# Just run it - Blue handles everything
 blue agent
 
-# Equivalent to:
-# 1. Ensure Blue daemon running (Ollama ready)
-# 2. Launch Goose with Blue extension
-# 3. Model auto-pulled if missing
+# What happens:
+# 1. Uses bundled Goose binary (downloaded at build time)
+# 2. Detects Ollama running on localhost:11434
+# 3. Selects largest model (best for agentic work)
+# 4. Sets GOOSE_PROVIDER=ollama, OLLAMA_HOST=...
+# 5. Connects Blue MCP extension for workflow tools
 ```
+
+**Manual Model Override:**
+
+```bash
+# Use a specific provider/model
+blue agent --model ollama/qwen2.5:7b
+blue agent --model anthropic/claude-sonnet-4-20250514
+
+# Pass additional Goose arguments
+blue agent -- --resume --name my-session
+```
+
+**Goose Binary Bundling:**
+
+Blue's `build.rs` downloads the Goose binary for the target platform:
+
+| Platform | Binary |
+|----------|--------|
+| macOS ARM64 | goose-aarch64-apple-darwin |
+| macOS x86_64 | goose-x86_64-apple-darwin |
+| Linux x86_64 | goose-x86_64-unknown-linux-gnu |
+| Linux ARM64 | goose-aarch64-unknown-linux-gnu |
+| Windows | goose-x86_64-pc-windows-gnu |
+
+**Build-time Download:**
+
+```rust
+// apps/blue-cli/build.rs
+const GOOSE_VERSION: &str = "1.21.1";
+
+// Downloads goose-{arch}-{os}.tar.bz2 from GitHub releases
+// Extracts to OUT_DIR, sets GOOSE_BINARY_PATH env var
+```
+
+**Runtime Discovery:**
+
+1. Check for bundled binary next to `blue` executable
+2. Check compile-time `GOOSE_BINARY_PATH`
+3. Fall back to system PATH (validates it's Block's Goose, not the DB migration tool)
 
 **Shared Model Benefits:**
 
 | Without Blue | With Blue |
 |--------------|-----------|
+| Install Goose separately | Blue bundles Goose |
 | Install Ollama separately | Blue bundles Ollama |
-| Configure Goose manually | `blue agent` just works |
-| Model loaded twice (Ollama + Goose) | One model instance |
+| Configure Goose manually | `blue agent` auto-configures |
+| Model loaded twice | One model instance |
 | 40GB RAM for two 32B models | 20GB for shared model |
 
 ### 6. Graceful Degradation

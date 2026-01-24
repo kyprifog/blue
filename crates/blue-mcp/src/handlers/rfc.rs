@@ -105,6 +105,12 @@ pub fn handle_complete(state: &ProjectState, args: &Value) -> Result<Value, Serv
         .update_document_status(DocType::Rfc, title, "implemented")
         .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
 
+    // Update markdown file (RFC 0008)
+    if let Some(ref file_path) = doc.file_path {
+        let full_path = state.home.docs_path.join(file_path);
+        let _ = blue_core::update_markdown_status(&full_path, "implemented");
+    }
+
     // Determine follow-up needs
     let followup_needed = percentage < 100;
     let remaining_count = total - completed;

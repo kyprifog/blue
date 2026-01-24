@@ -121,22 +121,10 @@ pub fn handle_complete(state: &ProjectState, args: &Value) -> Result<Value, Serv
         .update_document_status(DocType::Spike, title, "complete")
         .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
 
-    // Update the file if it exists
+    // Update markdown file (RFC 0008: use shared helper)
     if let Some(ref file_path) = doc.file_path {
-        let docs_path = state.home.docs_path.clone();
-        let spike_path = docs_path.join(file_path);
-
-        if spike_path.exists() {
-            let content = fs::read_to_string(&spike_path)
-                .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
-
-            let updated = content
-                .replace("| **Status** | In Progress |", "| **Status** | Complete |")
-                .replace("| **Status** | in-progress |", "| **Status** | Complete |");
-
-            fs::write(&spike_path, updated)
-                .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
-        }
+        let full_path = state.home.docs_path.join(file_path);
+        let _ = blue_core::update_markdown_status(&full_path, "complete");
     }
 
     let hint = match outcome {

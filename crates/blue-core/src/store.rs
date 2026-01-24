@@ -185,6 +185,7 @@ pub enum DocType {
     Postmortem,
     Runbook,
     Dialogue,
+    Audit,
 }
 
 impl DocType {
@@ -198,6 +199,7 @@ impl DocType {
             DocType::Postmortem => "postmortem",
             DocType::Runbook => "runbook",
             DocType::Dialogue => "dialogue",
+            DocType::Audit => "audit",
         }
     }
 
@@ -211,6 +213,7 @@ impl DocType {
             "postmortem" => Some(DocType::Postmortem),
             "runbook" => Some(DocType::Runbook),
             "dialogue" => Some(DocType::Dialogue),
+            "audit" => Some(DocType::Audit),
             _ => None,
         }
     }
@@ -226,6 +229,7 @@ impl DocType {
             DocType::Postmortem => "post-mortems",
             DocType::Runbook => "runbooks",
             DocType::Dialogue => "dialogues",
+            DocType::Audit => "audits",
         }
     }
 }

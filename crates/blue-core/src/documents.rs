@@ -103,6 +103,81 @@ pub struct Adr {
     pub consequences: Vec<String>,
 }
 
+/// An Audit document - formal findings report
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Audit {
+    pub title: String,
+    pub status: String,
+    pub date: String,
+    pub audit_type: AuditType,
+    pub scope: String,
+    pub summary: Option<String>,
+    pub findings: Vec<AuditFinding>,
+    pub recommendations: Vec<String>,
+}
+
+/// Types of audits
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuditType {
+    Repository,
+    Security,
+    RfcVerification,
+    AdrAdherence,
+    Custom,
+}
+
+impl AuditType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AuditType::Repository => "repository",
+            AuditType::Security => "security",
+            AuditType::RfcVerification => "rfc-verification",
+            AuditType::AdrAdherence => "adr-adherence",
+            AuditType::Custom => "custom",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "repository" => Some(AuditType::Repository),
+            "security" => Some(AuditType::Security),
+            "rfc-verification" => Some(AuditType::RfcVerification),
+            "adr-adherence" => Some(AuditType::AdrAdherence),
+            "custom" => Some(AuditType::Custom),
+            _ => None,
+        }
+    }
+}
+
+/// A finding within an audit
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditFinding {
+    pub category: String,
+    pub title: String,
+    pub description: String,
+    pub severity: AuditSeverity,
+}
+
+/// Severity of an audit finding
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuditSeverity {
+    Error,
+    Warning,
+    Info,
+}
+
+impl AuditSeverity {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AuditSeverity::Error => "error",
+            AuditSeverity::Warning => "warning",
+            AuditSeverity::Info => "info",
+        }
+    }
+}
+
 impl Rfc {
     /// Create a new RFC in draft status
     pub fn new(title: impl Into<String>) -> Self {
@@ -362,6 +437,75 @@ impl Decision {
     }
 }
 
+impl Audit {
+    /// Create a new Audit
+    pub fn new(title: impl Into<String>, audit_type: AuditType, scope: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            status: "in-progress".to_string(),
+            date: today(),
+            audit_type,
+            scope: scope.into(),
+            summary: None,
+            findings: Vec::new(),
+            recommendations: Vec::new(),
+        }
+    }
+
+    /// Generate markdown content
+    pub fn to_markdown(&self) -> String {
+        let mut md = String::new();
+
+        md.push_str(&format!("# Audit: {}\n\n", to_title_case(&self.title)));
+
+        md.push_str("| | |\n|---|---|\n");
+        md.push_str(&format!(
+            "| **Status** | {} |\n",
+            to_title_case(&self.status)
+        ));
+        md.push_str(&format!("| **Date** | {} |\n", self.date));
+        md.push_str(&format!(
+            "| **Type** | {} |\n",
+            to_title_case(self.audit_type.as_str())
+        ));
+        md.push_str(&format!("| **Scope** | {} |\n", self.scope));
+        md.push_str("\n---\n\n");
+
+        if let Some(ref summary) = self.summary {
+            md.push_str("## Executive Summary\n\n");
+            md.push_str(summary);
+            md.push_str("\n\n");
+        }
+
+        if !self.findings.is_empty() {
+            md.push_str("## Findings\n\n");
+            for finding in &self.findings {
+                md.push_str(&format!(
+                    "### {} ({})\n\n",
+                    finding.title,
+                    finding.severity.as_str()
+                ));
+                md.push_str(&format!("**Category:** {}\n\n", finding.category));
+                md.push_str(&finding.description);
+                md.push_str("\n\n");
+            }
+        }
+
+        if !self.recommendations.is_empty() {
+            md.push_str("## Recommendations\n\n");
+            for rec in &self.recommendations {
+                md.push_str(&format!("- {}\n", rec));
+            }
+            md.push('\n');
+        }
+
+        md.push_str("---\n\n");
+        md.push_str("*Audited by Blue*\n");
+
+        md
+    }
+}
+
 /// Get current date in YYYY-MM-DD format
 fn today() -> String {
     chrono::Utc::now().format("%Y-%m-%d").to_string()
@@ -379,6 +523,46 @@ fn to_title_case(s: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Update status in a markdown file
+///
+/// Handles common status patterns:
+/// - `| **Status** | Draft |` (table format)
+/// - `**Status:** Draft` (inline format)
+///
+/// Returns Ok(true) if status was updated, Ok(false) if no match found.
+pub fn update_markdown_status(
+    file_path: &std::path::Path,
+    new_status: &str,
+) -> Result<bool, std::io::Error> {
+    use std::fs;
+
+    if !file_path.exists() {
+        return Ok(false);
+    }
+
+    let content = fs::read_to_string(file_path)?;
+    let display_status = to_title_case(new_status);
+
+    // Try table format: | **Status** | <anything> |
+    let table_pattern = regex::Regex::new(r"\| \*\*Status\*\* \| [^|]+ \|").unwrap();
+    let mut updated = table_pattern
+        .replace(&content, format!("| **Status** | {} |", display_status).as_str())
+        .to_string();
+
+    // Also try inline format: **Status:** <word>
+    let inline_pattern = regex::Regex::new(r"\*\*Status:\*\* \S+").unwrap();
+    updated = inline_pattern
+        .replace(&updated, format!("**Status:** {}", display_status).as_str())
+        .to_string();
+
+    let changed = updated != content;
+    if changed {
+        fs::write(file_path, updated)?;
+    }
+
+    Ok(changed)
 }
 
 #[cfg(test)]
@@ -410,5 +594,42 @@ mod tests {
         let md = spike.to_markdown();
         assert!(md.contains("# Spike: Test Investigation"));
         assert!(md.contains("What should we do?"));
+    }
+
+    #[test]
+    fn test_update_markdown_status_table_format() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.md");
+
+        let content = "# RFC\n\n| | |\n|---|---|\n| **Status** | Draft |\n| **Date** | 2026-01-24 |\n";
+        fs::write(&file, content).unwrap();
+
+        let changed = update_markdown_status(&file, "implemented").unwrap();
+        assert!(changed);
+
+        let updated = fs::read_to_string(&file).unwrap();
+        assert!(updated.contains("| **Status** | Implemented |"));
+        assert!(!updated.contains("Draft"));
+    }
+
+    #[test]
+    fn test_update_markdown_status_no_file() {
+        let path = std::path::Path::new("/nonexistent/file.md");
+        let changed = update_markdown_status(path, "implemented").unwrap();
+        assert!(!changed);
+    }
+
+    #[test]
+    fn test_update_markdown_status_no_status_field() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.md");
+
+        let content = "# Just a document\n\nNo status here.\n";
+        fs::write(&file, content).unwrap();
+
+        let changed = update_markdown_status(&file, "implemented").unwrap();
+        assert!(!changed);
     }
 }

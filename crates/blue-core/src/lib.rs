@@ -23,7 +23,7 @@ pub mod store;
 pub mod voice;
 pub mod workflow;
 
-pub use documents::*;
+pub use documents::{Adr, Audit, AuditFinding, AuditSeverity, AuditType, Decision, Rfc, Spike, SpikeOutcome, Status, Task, update_markdown_status};
 pub use llm::{CompletionOptions, CompletionResult, LlmBackendChoice, LlmConfig, LlmError, LlmManager, LlmProvider, LlmProviderChoice, LocalLlmConfig, ApiLlmConfig, KeywordLlm, MockLlm, ProviderStatus};
 pub use repo::{detect_blue, BlueHome, RepoError, WorktreeInfo};
 pub use state::{ItemType, ProjectState, StateError, StatusSummary, WorkItem};

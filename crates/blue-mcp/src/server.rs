@@ -920,8 +920,8 @@ impl BlueServer {
                     }
                 },
                 {
-                    "name": "blue_audit",
-                    "description": "Check project health and find issues. Returns stalled work, missing ADRs, and recommendations.",
+                    "name": "blue_health_check",
+                    "description": "Check project health and find issues. Returns stalled work, missing ADRs, overdue reminders, and recommendations.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -930,6 +930,82 @@ impl BlueServer {
                                 "description": "Current working directory"
                             }
                         }
+                    }
+                },
+                {
+                    "name": "blue_audit_create",
+                    "description": "Create a new audit document (repository, security, rfc-verification, adr-adherence, or custom).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory"
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "Audit title in kebab-case"
+                            },
+                            "audit_type": {
+                                "type": "string",
+                                "description": "Type of audit",
+                                "enum": ["repository", "security", "rfc-verification", "adr-adherence", "custom"]
+                            },
+                            "scope": {
+                                "type": "string",
+                                "description": "What is being audited"
+                            }
+                        },
+                        "required": ["title"]
+                    }
+                },
+                {
+                    "name": "blue_audit_list",
+                    "description": "List all audit documents.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory"
+                            }
+                        }
+                    }
+                },
+                {
+                    "name": "blue_audit_get",
+                    "description": "Get an audit document by title.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory"
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "Audit title"
+                            }
+                        },
+                        "required": ["title"]
+                    }
+                },
+                {
+                    "name": "blue_audit_complete",
+                    "description": "Mark an audit as complete.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory"
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "Audit title"
+                            }
+                        },
+                        "required": ["title"]
                     }
                 },
                 {
@@ -1916,8 +1992,12 @@ impl BlueServer {
             "blue_staging_status" => self.handle_staging_status(&call.arguments),
             "blue_staging_cleanup" => self.handle_staging_cleanup(&call.arguments),
             "blue_staging_deployments" => self.handle_staging_deployments(&call.arguments),
-            // Phase 6: Audit and completion handlers
-            "blue_audit" => self.handle_audit(&call.arguments),
+            // Phase 6: Health check, audit documents, and completion handlers
+            "blue_health_check" => self.handle_health_check(&call.arguments),
+            "blue_audit_create" => self.handle_audit_create(&call.arguments),
+            "blue_audit_list" => self.handle_audit_list(&call.arguments),
+            "blue_audit_get" => self.handle_audit_get(&call.arguments),
+            "blue_audit_complete" => self.handle_audit_complete(&call.arguments),
             "blue_rfc_complete" => self.handle_rfc_complete(&call.arguments),
             "blue_worktree_cleanup" => self.handle_worktree_cleanup(&call.arguments),
             // Phase 7: PRD handlers
@@ -2203,13 +2283,27 @@ impl BlueServer {
 
         let state = self.ensure_state()?;
 
+        // Find the document to get its file path
+        let doc = state.store.find_document(DocType::Rfc, title)
+            .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
+
+        // Update database
         state.store.update_document_status(DocType::Rfc, title, status)
             .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
+
+        // Update markdown file (RFC 0008)
+        let file_updated = if let Some(ref file_path) = doc.file_path {
+            let full_path = state.home.docs_path.join(file_path);
+            blue_core::update_markdown_status(&full_path, status).unwrap_or(false)
+        } else {
+            false
+        };
 
         Ok(json!({
             "status": "success",
             "title": title,
             "new_status": status,
+            "file_updated": file_updated,
             "message": blue_core::voice::success(
                 &format!("Updated '{}' to {}", title, status),
                 None
@@ -2626,11 +2720,34 @@ impl BlueServer {
         crate::handlers::staging::handle_deployments(state, args)
     }
 
-    // Phase 6: Audit and completion handlers
+    // Phase 6: Health check, audit documents, and completion handlers
 
-    fn handle_audit(&mut self, _args: &Option<Value>) -> Result<Value, ServerError> {
+    fn handle_health_check(&mut self, _args: &Option<Value>) -> Result<Value, ServerError> {
         let state = self.ensure_state()?;
         crate::handlers::audit::handle_audit(state)
+    }
+
+    fn handle_audit_create(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        let state = self.ensure_state()?;
+        crate::handlers::audit_doc::handle_create(state, args)
+    }
+
+    fn handle_audit_list(&mut self, _args: &Option<Value>) -> Result<Value, ServerError> {
+        let state = self.ensure_state()?;
+        crate::handlers::audit_doc::handle_list(state)
+    }
+
+    fn handle_audit_get(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        let state = self.ensure_state()?;
+        crate::handlers::audit_doc::handle_get(state, args)
+    }
+
+    fn handle_audit_complete(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        let state = self.ensure_state()?;
+        crate::handlers::audit_doc::handle_complete(state, args)
     }
 
     fn handle_rfc_complete(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {

@@ -24,6 +24,7 @@ tower-http.workspace = true
 reqwest.workspace = true
 dirs.workspace = true
 semver.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 tower.workspace = true
