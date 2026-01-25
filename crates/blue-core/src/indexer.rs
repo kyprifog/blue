@@ -106,7 +106,7 @@ impl<P: LlmProvider> Indexer<P> {
         let options = CompletionOptions {
             max_tokens: self.config.max_tokens,
             temperature: self.config.temperature,
-            stop_sequences: vec!["```".to_string()], // Stop at end of YAML block
+            stop_sequences: vec![], // Let model complete naturally
         };
 
         let completion = self.provider.complete(&prompt, &options)

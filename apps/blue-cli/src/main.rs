@@ -1529,6 +1529,15 @@ async fn detect_ollama_model() -> Option<String> {
 // ==================== Semantic Index Commands (RFC 0010) ====================
 
 async fn handle_index_command(command: IndexCommands) -> Result<()> {
+    // Run the blocking indexer operations in a separate thread
+    // to avoid runtime conflicts with reqwest::blocking::Client
+    tokio::task::spawn_blocking(move || {
+        handle_index_command_blocking(command)
+    }).await??;
+    Ok(())
+}
+
+fn handle_index_command_blocking(command: IndexCommands) -> Result<()> {
     use blue_core::store::DocumentStore;
     use blue_core::{Indexer, IndexerConfig, is_indexable_file, LocalLlmConfig};
     use blue_ollama::OllamaLlm;
