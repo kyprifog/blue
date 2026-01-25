@@ -27,6 +27,9 @@ pub enum ServerError {
 
     #[error("Not found: {0}")]
     NotFound(String),
+
+    #[error("Workflow error: {0}")]
+    Workflow(String),
 }
 
 impl ServerError {
@@ -41,6 +44,7 @@ impl ServerError {
             ServerError::StateLoadFailed(_) => -32001,
             ServerError::CommandFailed(_) => -32002,
             ServerError::NotFound(_) => -32003,
+            ServerError::Workflow(_) => -32004,
         }
     }
 }

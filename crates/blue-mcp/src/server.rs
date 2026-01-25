@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{debug, info};
 
-use blue_core::{detect_blue, DocType, Document, ProjectState, Rfc};
+use blue_core::{detect_blue, DocType, Document, ProjectState, Rfc, RfcStatus, validate_rfc_transition};
 
 use crate::error::ServerError;
 
@@ -2398,39 +2398,68 @@ impl BlueServer {
             .and_then(|v| v.as_str())
             .ok_or(ServerError::InvalidParams)?;
 
-        let status = args
+        let status_str = args
             .get("status")
             .and_then(|v| v.as_str())
             .ok_or(ServerError::InvalidParams)?;
 
         let state = self.ensure_state()?;
 
-        // Find the document to get its file path
+        // Find the document to get its file path and current status
         let doc = state.store.find_document(DocType::Rfc, title)
             .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
 
+        // Parse statuses and validate transition (RFC 0014)
+        let current_status = RfcStatus::parse(&doc.status)
+            .map_err(|e| ServerError::Workflow(e.to_string()))?;
+        let target_status = RfcStatus::parse(status_str)
+            .map_err(|e| ServerError::Workflow(e.to_string()))?;
+
+        // Validate the transition
+        validate_rfc_transition(current_status, target_status)
+            .map_err(|e| ServerError::Workflow(e.to_string()))?;
+
         // Check for worktree if going to in-progress (RFC 0011)
         let has_worktree = state.has_worktree(title);
-        let worktree_warning = if status == "in-progress" && !has_worktree {
+        let worktree_warning = if status_str == "in-progress" && !has_worktree {
             Some("No worktree exists for this RFC. Consider using blue_worktree_create for isolated development.")
         } else {
             None
         };
 
         // Update database
-        state.store.update_document_status(DocType::Rfc, title, status)
+        state.store.update_document_status(DocType::Rfc, title, status_str)
             .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
 
         // Update markdown file (RFC 0008)
         let file_updated = if let Some(ref file_path) = doc.file_path {
             let full_path = state.home.docs_path.join(file_path);
-            blue_core::update_markdown_status(&full_path, status).unwrap_or(false)
+            blue_core::update_markdown_status(&full_path, status_str).unwrap_or(false)
         } else {
             false
         };
 
+        // Conversational hints guide Claude to next action (RFC 0014)
+        let hint = match target_status {
+            RfcStatus::Accepted => Some(
+                "RFC accepted. Ask the user: 'Ready to begin implementation? \
+                 I'll create a worktree and set up the environment.'"
+            ),
+            RfcStatus::InProgress => Some(
+                "Implementation started. Work in the worktree, mark plan tasks \
+                 as you complete them."
+            ),
+            RfcStatus::Implemented => Some(
+                "Implementation complete. Ask the user: 'Ready to create a PR?'"
+            ),
+            RfcStatus::Superseded => Some(
+                "RFC superseded. The newer RFC takes precedence."
+            ),
+            RfcStatus::Draft => None,
+        };
+
         // Build next_action for accepted status (RFC 0011)
-        let next_action = if status == "accepted" {
+        let next_action = if status_str == "accepted" {
             Some(json!({
                 "tool": "blue_worktree_create",
                 "args": { "title": title },
@@ -2443,11 +2472,11 @@ impl BlueServer {
         let mut response = json!({
             "status": "success",
             "title": title,
-            "new_status": status,
+            "new_status": status_str,
             "file_updated": file_updated,
             "message": blue_core::voice::success(
-                &format!("Updated '{}' to {}", title, status),
-                None
+                &format!("Updated '{}' to {}", title, status_str),
+                hint
             )
         });
 

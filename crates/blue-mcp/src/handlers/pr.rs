@@ -14,7 +14,7 @@
 
 use std::process::Command;
 
-use blue_core::{CreatePrOpts, MergeStrategy, ProjectState, create_forge_cached, detect_forge_type_cached, parse_git_url};
+use blue_core::{CreatePrOpts, DocType, MergeStrategy, ProjectState, create_forge_cached, detect_forge_type_cached, parse_git_url};
 use serde_json::{json, Value};
 
 use crate::error::ServerError;
@@ -40,6 +40,36 @@ pub enum TaskCategory {
 /// Uses native REST API for the detected forge (GitHub or Forgejo/Gitea).
 pub fn handle_create(state: &ProjectState, args: &Value) -> Result<Value, ServerError> {
     let rfc = args.get("rfc").and_then(|v| v.as_str());
+
+    // If RFC is provided, validate workflow state (RFC 0014)
+    if let Some(rfc_title) = rfc {
+        // Check RFC exists and has worktree
+        if let Ok(doc) = state.store.find_document(DocType::Rfc, rfc_title) {
+            // Warn if RFC isn't implemented yet
+            if doc.status != "implemented" && doc.status != "in-progress" {
+                return Ok(json!({
+                    "status": "error",
+                    "message": blue_core::voice::error(
+                        &format!("RFC '{}' is {} - complete implementation first", rfc_title, doc.status),
+                        "Use blue_rfc_complete after finishing work"
+                    )
+                }));
+            }
+
+            // Check worktree exists
+            if let Some(doc_id) = doc.id {
+                if state.store.get_worktree(doc_id).ok().flatten().is_none() {
+                    return Ok(json!({
+                        "status": "warning",
+                        "message": blue_core::voice::error(
+                            "No worktree for this RFC",
+                            "PRs usually come from worktrees. Proceed with caution."
+                        )
+                    }));
+                }
+            }
+        }
+    }
 
     // If RFC is provided, format title as "RFC NNNN: Title Case Name"
     let title = if let Some(rfc_title) = rfc {

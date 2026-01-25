@@ -119,17 +119,37 @@ pub fn handle_create(state: &ProjectState, args: &Value) -> Result<Value, Server
         }));
     }
 
+    // Check RFC has a plan (RFC 0014: plan enforcement)
+    let doc_id = doc.id.ok_or(ServerError::InvalidParams)?;
+    let tasks = state
+        .store
+        .get_tasks(doc_id)
+        .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
+
+    if tasks.is_empty() {
+        return Ok(json!({
+            "status": "error",
+            "message": blue_core::voice::error(
+                &format!("RFC '{}' needs a plan before creating worktree", title),
+                "Create a plan first with blue_rfc_plan"
+            ),
+            "next_action": {
+                "tool": "blue_rfc_plan",
+                "args": { "title": title },
+                "hint": "Create implementation tasks before starting work"
+            }
+        }));
+    }
+
     // Check if worktree already exists
-    if let Some(id) = doc.id {
-        if let Ok(Some(_existing)) = state.store.get_worktree(id) {
-            return Ok(json!({
-                "status": "error",
-                "message": blue_core::voice::error(
-                    &format!("Worktree for '{}' already exists", title),
-                    "Use blue_worktree_list to see active worktrees"
-                )
-            }));
-        }
+    if let Ok(Some(_existing)) = state.store.get_worktree(doc_id) {
+        return Ok(json!({
+            "status": "error",
+            "message": blue_core::voice::error(
+                &format!("Worktree for '{}' already exists", title),
+                "Use blue_worktree_list to see active worktrees"
+            )
+        }));
     }
 
     // Create branch name and worktree path (RFC 0007: strip number prefix)
@@ -144,16 +164,14 @@ pub fn handle_create(state: &ProjectState, args: &Value) -> Result<Value, Server
             match blue_core::repo::create_worktree(&repo, &branch_name, &worktree_path) {
                 Ok(()) => {
                     // Record in store
-                    if let Some(doc_id) = doc.id {
-                        let wt = StoreWorktree {
-                            id: None,
-                            document_id: doc_id,
-                            branch_name: branch_name.clone(),
-                            worktree_path: worktree_path.display().to_string(),
-                            created_at: None,
-                        };
-                        let _ = state.store.add_worktree(&wt);
-                    }
+                    let wt = StoreWorktree {
+                        id: None,
+                        document_id: doc_id,
+                        branch_name: branch_name.clone(),
+                        worktree_path: worktree_path.display().to_string(),
+                        created_at: None,
+                    };
+                    let _ = state.store.add_worktree(&wt);
 
                     // Update RFC status to in-progress if accepted
                     if doc.status == "accepted" {
@@ -478,5 +496,24 @@ mod tests {
         let (stripped, number) = strip_rfc_number_prefix("0007feature");
         assert_eq!(stripped, "0007feature");
         assert_eq!(number, None);
+    }
+
+    #[test]
+    fn test_worktree_requires_plan() {
+        use blue_core::{Document, ProjectState};
+
+        let state = ProjectState::for_test();
+
+        // Create an accepted RFC without a plan
+        let mut doc = Document::new(DocType::Rfc, "test-rfc", "accepted");
+        doc.number = Some(1);
+        state.store.add_document(&doc).unwrap();
+
+        // Try to create worktree - should fail due to missing plan
+        let args = serde_json::json!({ "title": "test-rfc" });
+        let result = handle_create(&state, &args).unwrap();
+
+        assert_eq!(result["status"], "error");
+        assert!(result["message"].as_str().unwrap().contains("needs a plan"));
     }
 }
