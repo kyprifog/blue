@@ -481,7 +481,7 @@ impl BlueServer {
                 },
                 {
                     "name": "blue_worktree_create",
-                    "description": "Create an isolated git worktree for RFC implementation.",
+                    "description": "Create an isolated git worktree for RFC implementation. Use after an RFC is accepted, before starting work. Creates a feature branch and isolated directory.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -534,7 +534,7 @@ impl BlueServer {
                 },
                 {
                     "name": "blue_pr_create",
-                    "description": "Create a PR with enforced base branch (develop, not main). If rfc is provided, title is formatted as 'RFC NNNN: Title Case Name'.",
+                    "description": "Create a PR with enforced base branch (develop, not main). Use after implementation is complete and blue_rfc_complete succeeds. If rfc is provided, title is formatted as 'RFC NNNN: Title Case Name'.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -1010,7 +1010,7 @@ impl BlueServer {
                 },
                 {
                     "name": "blue_rfc_complete",
-                    "description": "Mark RFC as implemented based on plan progress. Requires at least 70% completion.",
+                    "description": "Mark RFC as implemented based on plan progress. Use after completing tasks in the worktree. Requires at least 70% completion. Follow with blue_pr_create.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -2231,7 +2231,7 @@ impl BlueServer {
                     )]
                 } else if !summary.ready.is_empty() {
                     vec![format!(
-                        "'{}' is ready to implement. Run 'blue worktree create {}' to start.",
+                        "'{}' is ready to implement. Use blue_worktree_create with title='{}' to start.",
                         summary.ready[0].title, summary.ready[0].title
                     )]
                 } else if !summary.drafts.is_empty() {
@@ -2409,6 +2409,14 @@ impl BlueServer {
         let doc = state.store.find_document(DocType::Rfc, title)
             .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
 
+        // Check for worktree if going to in-progress (RFC 0011)
+        let has_worktree = state.has_worktree(title);
+        let worktree_warning = if status == "in-progress" && !has_worktree {
+            Some("No worktree exists for this RFC. Consider using blue_worktree_create for isolated development.")
+        } else {
+            None
+        };
+
         // Update database
         state.store.update_document_status(DocType::Rfc, title, status)
             .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
@@ -2421,7 +2429,18 @@ impl BlueServer {
             false
         };
 
-        Ok(json!({
+        // Build next_action for accepted status (RFC 0011)
+        let next_action = if status == "accepted" {
+            Some(json!({
+                "tool": "blue_worktree_create",
+                "args": { "title": title },
+                "hint": "Create a worktree to start implementation"
+            }))
+        } else {
+            None
+        };
+
+        let mut response = json!({
             "status": "success",
             "title": title,
             "new_status": status,
@@ -2430,7 +2449,17 @@ impl BlueServer {
                 &format!("Updated '{}' to {}", title, status),
                 None
             )
-        }))
+        });
+
+        // Add optional fields
+        if let Some(action) = next_action {
+            response["next_action"] = action;
+        }
+        if let Some(warning) = worktree_warning {
+            response["warning"] = json!(warning);
+        }
+
+        Ok(response)
     }
 
     fn handle_rfc_plan(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
