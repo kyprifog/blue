@@ -886,7 +886,7 @@ pub fn generate_alignment_dialogue_markdown(
     md.push_str("| — | [Awaiting Round 1] | — | — | — |\n\n");
 
     // Opening Arguments placeholder
-    md.push_str("## Round 0: Opening Arguments\n\n");
+    md.push_str("## Round 1: Opening Arguments\n\n");
     for agent in agents {
         md.push_str(&format!("### {} {}\n\n", agent.name, agent.emoji));
         md.push_str("[Awaiting response]\n\n");
@@ -1128,7 +1128,7 @@ mod tests {
         assert!(md.contains("## Alignment Scoreboard"));
         assert!(md.contains("## Perspectives Inventory"));
         assert!(md.contains("## Tensions Tracker"));
-        assert!(md.contains("## Round 0: Opening Arguments"));
+        assert!(md.contains("## Round 1: Opening Arguments"));
 
         // Agent names present
         assert!(md.contains("Muffin"));
