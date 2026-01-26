@@ -145,6 +145,31 @@ impl BlueUri {
 
                 match id {
                     Some(id) => {
+                        // RFC 0019: Check for /plan suffix to return plan file
+                        if id.ends_with("/plan") {
+                            let rfc_num = id.trim_end_matches("/plan");
+                            // Find the RFC file to get its title
+                            let entries = std::fs::read_dir(&type_dir)?;
+                            for entry in entries.flatten() {
+                                let path = entry.path();
+                                if let Some(name) = path.file_stem().and_then(|n| n.to_str()) {
+                                    if let Some(num_str) = name.split('-').next() {
+                                        if num_str == rfc_num
+                                            || num_str.trim_start_matches('0') == rfc_num
+                                        {
+                                            // Found the RFC, now get its plan file
+                                            let plan_name = format!("{}.plan.md", name);
+                                            let plan_path = type_dir.join(plan_name);
+                                            if plan_path.exists() {
+                                                return Ok(vec![plan_path]);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            return Ok(Vec::new());
+                        }
+
                         // Specific document - try exact match or pattern match
                         let exact = type_dir.join(format!("{}.md", id));
                         if exact.exists() {

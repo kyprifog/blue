@@ -7,10 +7,18 @@ use std::thread;
 use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use sha2::{Sha256, Digest};
 use tracing::{debug, info, warn};
 
+/// Compute a SHA-256 hash of content for staleness detection (RFC 0018)
+pub fn hash_content(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 /// Current schema version
-const SCHEMA_VERSION: i32 = 7;
+const SCHEMA_VERSION: i32 = 8;
 
 /// Core database schema
 const SCHEMA: &str = r#"
@@ -28,6 +36,8 @@ const SCHEMA: &str = r#"
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         deleted_at TEXT,
+        content_hash TEXT,
+        indexed_at TEXT,
         UNIQUE(doc_type, title)
     );
 
@@ -352,6 +362,21 @@ impl DocType {
             DocType::Audit => "audits",
         }
     }
+
+    /// Subdirectory in .blue/docs/ (RFC 0018)
+    pub fn subdir(&self) -> &'static str {
+        match self {
+            DocType::Rfc => "rfcs",
+            DocType::Spike => "spikes",
+            DocType::Adr => "adrs",
+            DocType::Decision => "decisions",
+            DocType::Prd => "prds",
+            DocType::Postmortem => "postmortems",
+            DocType::Runbook => "runbooks",
+            DocType::Dialogue => "dialogues",
+            DocType::Audit => "audits",
+        }
+    }
 }
 
 /// Link types between documents
@@ -393,6 +418,10 @@ pub struct Document {
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub deleted_at: Option<String>,
+    /// Content hash for staleness detection (RFC 0018)
+    pub content_hash: Option<String>,
+    /// When the document was last indexed from filesystem (RFC 0018)
+    pub indexed_at: Option<String>,
 }
 
 impl Document {
@@ -408,6 +437,8 @@ impl Document {
             created_at: None,
             updated_at: None,
             deleted_at: None,
+            content_hash: None,
+            indexed_at: None,
         }
     }
 
@@ -415,6 +446,144 @@ impl Document {
     pub fn is_deleted(&self) -> bool {
         self.deleted_at.is_some()
     }
+
+    /// Check if document is stale based on content hash (RFC 0018)
+    pub fn is_stale(&self, file_path: &Path) -> bool {
+        use std::fs;
+
+        // If no file exists, document isn't stale (it's orphaned, handled separately)
+        if !file_path.exists() {
+            return false;
+        }
+
+        // If we have no hash, document is stale (needs indexing)
+        let Some(ref stored_hash) = self.content_hash else {
+            return true;
+        };
+
+        // Fast path: check mtime if we have indexed_at
+        if let Some(ref indexed_at) = self.indexed_at {
+            if let Ok(metadata) = fs::metadata(file_path) {
+                if let Ok(modified) = metadata.modified() {
+                    let file_mtime: chrono::DateTime<chrono::Utc> = modified.into();
+                    if let Ok(indexed_time) = chrono::DateTime::parse_from_rfc3339(indexed_at) {
+                        // File hasn't changed since indexing
+                        if file_mtime <= indexed_time {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Slow path: verify with hash
+        if let Ok(content) = fs::read_to_string(file_path) {
+            let current_hash = hash_content(&content);
+            return current_hash != *stored_hash;
+        }
+
+        // If we can't read the file, assume not stale
+        false
+    }
+}
+
+/// Result of parsing a document from a file (RFC 0018)
+#[derive(Debug, Clone)]
+pub struct ParsedDocument {
+    pub doc_type: DocType,
+    pub title: String,
+    pub number: Option<i32>,
+    pub status: String,
+    pub content_hash: String,
+}
+
+/// Parse document metadata from a markdown file's frontmatter (RFC 0018)
+///
+/// Extracts title, number, status from the header table format:
+/// ```markdown
+/// # RFC 0042: My Feature
+///
+/// | | |
+/// |---|---|
+/// | **Status** | Draft |
+/// ```
+pub fn parse_document_from_file(file_path: &Path) -> Result<ParsedDocument, StoreError> {
+    use std::fs;
+
+    let content = fs::read_to_string(file_path)
+        .map_err(|e| StoreError::IoError(e.to_string()))?;
+
+    // Determine doc type from path
+    let path_str = file_path.to_string_lossy();
+    let doc_type = if path_str.contains("/rfcs/") {
+        DocType::Rfc
+    } else if path_str.contains("/spikes/") {
+        DocType::Spike
+    } else if path_str.contains("/adrs/") {
+        DocType::Adr
+    } else if path_str.contains("/decisions/") {
+        DocType::Decision
+    } else if path_str.contains("/postmortems/") {
+        DocType::Postmortem
+    } else if path_str.contains("/runbooks/") {
+        DocType::Runbook
+    } else if path_str.contains("/dialogues/") {
+        DocType::Dialogue
+    } else if path_str.contains("/audits/") {
+        DocType::Audit
+    } else if path_str.contains("/prds/") {
+        DocType::Prd
+    } else {
+        return Err(StoreError::InvalidOperation(
+            format!("Unknown document type for path: {}", path_str)
+        ));
+    };
+
+    // Extract title from first line: # Type NNNN: Title or # Type: Title
+    let title_re = regex::Regex::new(r"^#\s+(?:\w+)\s*(?:(\d+):?)?\s*:?\s*(.+)$").unwrap();
+    let title_line = content.lines().next()
+        .ok_or_else(|| StoreError::InvalidOperation("Empty file".to_string()))?;
+
+    let (number, title) = if let Some(caps) = title_re.captures(title_line) {
+        let num = caps.get(1).and_then(|m| m.as_str().parse().ok());
+        let title = caps.get(2)
+            .map(|m| m.as_str().trim().to_string())
+            .unwrap_or_else(|| "untitled".to_string());
+        (num, title)
+    } else {
+        // Fallback: use filename as title
+        let stem = file_path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("untitled");
+        // Try to extract number from filename like "0042-my-feature.md"
+        let num_re = regex::Regex::new(r"^(\d+)-(.+)$").unwrap();
+        if let Some(caps) = num_re.captures(stem) {
+            let num = caps.get(1).and_then(|m| m.as_str().parse().ok());
+            let title = caps.get(2).map(|m| m.as_str().to_string()).unwrap_or_else(|| stem.to_string());
+            (num, title)
+        } else {
+            (None, stem.to_string())
+        }
+    };
+
+    // Extract status from table format: | **Status** | Draft |
+    let status_re = regex::Regex::new(r"\|\s*\*\*Status\*\*\s*\|\s*([^|]+)\s*\|").unwrap();
+    let status = content.lines()
+        .find_map(|line| {
+            status_re.captures(line)
+                .map(|c| c.get(1).unwrap().as_str().trim().to_lowercase())
+        })
+        .unwrap_or_else(|| "draft".to_string());
+
+    let content_hash = hash_content(&content);
+
+    Ok(ParsedDocument {
+        doc_type,
+        title,
+        number,
+        status,
+        content_hash,
+    })
 }
 
 /// A task in a document's plan
@@ -452,6 +621,35 @@ pub struct SearchResult {
     pub document: Document,
     pub score: f64,
     pub snippet: Option<String>,
+}
+
+/// Result of reconciling database with filesystem (RFC 0018)
+#[derive(Debug, Clone, Default)]
+pub struct ReconcileResult {
+    /// Files found on filesystem but not in database
+    pub unindexed: Vec<String>,
+    /// DB records with no corresponding file
+    pub orphaned: Vec<String>,
+    /// Files that have changed since last index
+    pub stale: Vec<String>,
+    /// Number of documents added (when not dry_run)
+    pub added: usize,
+    /// Number of documents updated (when not dry_run)
+    pub updated: usize,
+    /// Number of documents soft-deleted (when not dry_run)
+    pub soft_deleted: usize,
+}
+
+impl ReconcileResult {
+    /// Check if there is any drift between filesystem and database
+    pub fn has_drift(&self) -> bool {
+        !self.unindexed.is_empty() || !self.orphaned.is_empty() || !self.stale.is_empty()
+    }
+
+    /// Total count of issues found
+    pub fn drift_count(&self) -> usize {
+        self.unindexed.len() + self.orphaned.len() + self.stale.len()
+    }
 }
 
 /// Session types for multi-agent coordination
@@ -864,6 +1062,9 @@ pub enum StoreError {
 
     #[error("Can't do that: {0}")]
     InvalidOperation(String),
+
+    #[error("File system error: {0}")]
+    IoError(String),
 }
 
 /// Check if an error is a busy/locked error
@@ -1145,6 +1346,44 @@ impl DocumentStore {
             )?;
         }
 
+        // Migration from v7 to v8: Add content_hash and indexed_at columns (RFC 0018)
+        if from_version < 8 {
+            debug!("Adding content_hash and indexed_at columns (RFC 0018)");
+
+            // Check if columns exist first
+            let has_content_hash: bool = self.conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('documents') WHERE name = 'content_hash'",
+                [],
+                |row| Ok(row.get::<_, i64>(0)? > 0),
+            )?;
+
+            if !has_content_hash {
+                self.conn.execute(
+                    "ALTER TABLE documents ADD COLUMN content_hash TEXT",
+                    [],
+                )?;
+            }
+
+            let has_indexed_at: bool = self.conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('documents') WHERE name = 'indexed_at'",
+                [],
+                |row| Ok(row.get::<_, i64>(0)? > 0),
+            )?;
+
+            if !has_indexed_at {
+                self.conn.execute(
+                    "ALTER TABLE documents ADD COLUMN indexed_at TEXT",
+                    [],
+                )?;
+            }
+
+            // Add index for staleness checking
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_documents_content_hash ON documents(content_hash)",
+                [],
+            )?;
+        }
+
         // Update schema version
         self.conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -1188,8 +1427,8 @@ impl DocumentStore {
         self.with_retry(|| {
             let now = chrono::Utc::now().to_rfc3339();
             self.conn.execute(
-                "INSERT INTO documents (doc_type, number, title, status, file_path, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO documents (doc_type, number, title, status, file_path, created_at, updated_at, content_hash, indexed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     doc.doc_type.as_str(),
                     doc.number,
@@ -1198,6 +1437,8 @@ impl DocumentStore {
                     doc.file_path,
                     now,
                     now,
+                    doc.content_hash,
+                    doc.indexed_at.as_ref().unwrap_or(&now),
                 ],
             )?;
             Ok(self.conn.last_insert_rowid())
@@ -1208,7 +1449,7 @@ impl DocumentStore {
     pub fn get_document(&self, doc_type: DocType, title: &str) -> Result<Document, StoreError> {
         self.conn
             .query_row(
-                "SELECT id, doc_type, number, title, status, file_path, created_at, updated_at, deleted_at
+                "SELECT id, doc_type, number, title, status, file_path, created_at, updated_at, deleted_at, content_hash, indexed_at
                  FROM documents WHERE doc_type = ?1 AND title = ?2 AND deleted_at IS NULL",
                 params![doc_type.as_str(), title],
                 |row| {
@@ -1222,6 +1463,8 @@ impl DocumentStore {
                         created_at: row.get(6)?,
                         updated_at: row.get(7)?,
                         deleted_at: row.get(8)?,
+                        content_hash: row.get(9)?,
+                        indexed_at: row.get(10)?,
                     })
                 },
             )
@@ -1235,7 +1478,7 @@ impl DocumentStore {
     pub fn get_document_by_id(&self, id: i64) -> Result<Document, StoreError> {
         self.conn
             .query_row(
-                "SELECT id, doc_type, number, title, status, file_path, created_at, updated_at, deleted_at
+                "SELECT id, doc_type, number, title, status, file_path, created_at, updated_at, deleted_at, content_hash, indexed_at
                  FROM documents WHERE id = ?1",
                 params![id],
                 |row| {
@@ -1249,6 +1492,8 @@ impl DocumentStore {
                         created_at: row.get(6)?,
                         updated_at: row.get(7)?,
                         deleted_at: row.get(8)?,
+                        content_hash: row.get(9)?,
+                        indexed_at: row.get(10)?,
                     })
                 },
             )
@@ -1268,7 +1513,7 @@ impl DocumentStore {
     ) -> Result<Document, StoreError> {
         self.conn
             .query_row(
-                "SELECT id, doc_type, number, title, status, file_path, created_at, updated_at, deleted_at
+                "SELECT id, doc_type, number, title, status, file_path, created_at, updated_at, deleted_at, content_hash, indexed_at
                  FROM documents WHERE doc_type = ?1 AND number = ?2 AND deleted_at IS NULL",
                 params![doc_type.as_str(), number],
                 |row| {
@@ -1282,6 +1527,8 @@ impl DocumentStore {
                         created_at: row.get(6)?,
                         updated_at: row.get(7)?,
                         deleted_at: row.get(8)?,
+                        content_hash: row.get(9)?,
+                        indexed_at: row.get(10)?,
                     })
                 },
             )
@@ -1315,7 +1562,7 @@ impl DocumentStore {
         // Try substring match
         let pattern = format!("%{}%", query.to_lowercase());
         if let Ok(doc) = self.conn.query_row(
-            "SELECT id, doc_type, number, title, status, file_path, created_at, updated_at, deleted_at
+            "SELECT id, doc_type, number, title, status, file_path, created_at, updated_at, deleted_at, content_hash, indexed_at
              FROM documents WHERE doc_type = ?1 AND LOWER(title) LIKE ?2 AND deleted_at IS NULL
              ORDER BY LENGTH(title) ASC LIMIT 1",
             params![doc_type.as_str(), pattern],
@@ -1330,6 +1577,8 @@ impl DocumentStore {
                     created_at: row.get(6)?,
                     updated_at: row.get(7)?,
                     deleted_at: row.get(8)?,
+                    content_hash: row.get(9)?,
+                    indexed_at: row.get(10)?,
                 })
             },
         ) {
@@ -1341,6 +1590,272 @@ impl DocumentStore {
             doc_type.as_str(),
             query
         )))
+    }
+
+    /// Find a document with filesystem fallback (RFC 0018)
+    ///
+    /// First tries the database, then falls back to scanning the filesystem
+    /// if the document isn't found. Any document found on filesystem is
+    /// automatically registered in the database.
+    pub fn find_document_with_fallback(
+        &self,
+        doc_type: DocType,
+        query: &str,
+        docs_path: &Path,
+    ) -> Result<Document, StoreError> {
+        // Try database first (fast path)
+        if let Ok(doc) = self.find_document(doc_type, query) {
+            return Ok(doc);
+        }
+
+        // Fall back to filesystem scan
+        self.scan_and_register(doc_type, query, docs_path)
+    }
+
+    /// Scan filesystem for a document and register it (RFC 0018)
+    pub fn scan_and_register(
+        &self,
+        doc_type: DocType,
+        query: &str,
+        docs_path: &Path,
+    ) -> Result<Document, StoreError> {
+        use std::fs;
+
+        let subdir = match doc_type {
+            DocType::Rfc => "rfcs",
+            DocType::Spike => "spikes",
+            DocType::Adr => "adrs",
+            DocType::Decision => "decisions",
+            DocType::Dialogue => "dialogues",
+            DocType::Audit => "audits",
+            DocType::Runbook => "runbooks",
+            DocType::Postmortem => "postmortems",
+            DocType::Prd => "prds",
+        };
+
+        let search_dir = docs_path.join(subdir);
+        if !search_dir.exists() {
+            return Err(StoreError::NotFound(format!(
+                "{} matching '{}' (directory {} not found)",
+                doc_type.as_str(),
+                query,
+                search_dir.display()
+            )));
+        }
+
+        let query_lower = query.to_lowercase();
+
+        // Try to parse query as a number
+        let query_num: Option<i32> = query.trim_start_matches('0')
+            .parse()
+            .ok()
+            .or_else(|| if query == "0" { Some(0) } else { None });
+
+        // Scan directory for matching files
+        let entries = fs::read_dir(&search_dir)
+            .map_err(|e| StoreError::IoError(e.to_string()))?;
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e == "md").unwrap_or(false) {
+                // Skip .plan.md files
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.ends_with(".plan.md") {
+                        continue;
+                    }
+                }
+
+                // Try to parse the file
+                if let Ok(parsed) = parse_document_from_file(&path) {
+                    if parsed.doc_type != doc_type {
+                        continue;
+                    }
+
+                    // Check if this file matches the query
+                    let matches = parsed.title.to_lowercase().contains(&query_lower)
+                        || query_num.map(|n| parsed.number == Some(n)).unwrap_or(false);
+
+                    if matches {
+                        // Register this document in the database
+                        let relative_path = path.strip_prefix(docs_path)
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_else(|_| path.to_string_lossy().to_string());
+
+                        let doc = Document {
+                            id: None,
+                            doc_type: parsed.doc_type,
+                            number: parsed.number,
+                            title: parsed.title,
+                            status: parsed.status,
+                            file_path: Some(relative_path),
+                            created_at: None,
+                            updated_at: None,
+                            deleted_at: None,
+                            content_hash: Some(parsed.content_hash),
+                            indexed_at: Some(chrono::Utc::now().to_rfc3339()),
+                        };
+
+                        let id = self.add_document(&doc)?;
+                        return self.get_document_by_id(id);
+                    }
+                }
+            }
+        }
+
+        Err(StoreError::NotFound(format!(
+            "{} matching '{}'",
+            doc_type.as_str(),
+            query
+        )))
+    }
+
+    /// Register a document from a file path (RFC 0018)
+    pub fn register_from_file(&self, file_path: &Path, docs_path: &Path) -> Result<Document, StoreError> {
+        let parsed = parse_document_from_file(file_path)?;
+
+        let relative_path = file_path.strip_prefix(docs_path)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| file_path.to_string_lossy().to_string());
+
+        let doc = Document {
+            id: None,
+            doc_type: parsed.doc_type,
+            number: parsed.number,
+            title: parsed.title,
+            status: parsed.status,
+            file_path: Some(relative_path),
+            created_at: None,
+            updated_at: None,
+            deleted_at: None,
+            content_hash: Some(parsed.content_hash),
+            indexed_at: Some(chrono::Utc::now().to_rfc3339()),
+        };
+
+        let id = self.add_document(&doc)?;
+        self.get_document_by_id(id)
+    }
+
+    /// Reconcile database with filesystem (RFC 0018)
+    ///
+    /// Scans the filesystem for documents and reconciles with the database:
+    /// - Files without DB records: create records
+    /// - DB records without files: soft-delete records
+    /// - Hash mismatch: update DB from file
+    pub fn reconcile(
+        &self,
+        docs_path: &Path,
+        doc_type: Option<DocType>,
+        dry_run: bool,
+    ) -> Result<ReconcileResult, StoreError> {
+        use std::collections::HashSet;
+        use std::fs;
+
+        let mut result = ReconcileResult::default();
+
+        let subdirs: Vec<(&str, DocType)> = match doc_type {
+            Some(dt) => vec![(dt.subdir(), dt)],
+            None => vec![
+                ("rfcs", DocType::Rfc),
+                ("spikes", DocType::Spike),
+                ("adrs", DocType::Adr),
+                ("decisions", DocType::Decision),
+                ("dialogues", DocType::Dialogue),
+                ("audits", DocType::Audit),
+                ("runbooks", DocType::Runbook),
+                ("postmortems", DocType::Postmortem),
+                ("prds", DocType::Prd),
+            ],
+        };
+
+        for (subdir, dt) in subdirs {
+            let search_dir = docs_path.join(subdir);
+            if !search_dir.exists() {
+                continue;
+            }
+
+            // Track files we've seen
+            let mut seen_files: HashSet<String> = HashSet::new();
+
+            // Scan filesystem
+            if let Ok(entries) = fs::read_dir(&search_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().map(|e| e == "md").unwrap_or(false) {
+                        // Skip .plan.md files
+                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                            if name.ends_with(".plan.md") {
+                                continue;
+                            }
+                        }
+
+                        let relative_path = path.strip_prefix(docs_path)
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_else(|_| path.to_string_lossy().to_string());
+
+                        seen_files.insert(relative_path.clone());
+
+                        // Check if file is in database
+                        if let Ok(parsed) = parse_document_from_file(&path) {
+                            if parsed.doc_type != dt {
+                                continue;
+                            }
+
+                            // Try to find existing document
+                            let existing = self.list_documents(dt)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .find(|d| d.file_path.as_ref() == Some(&relative_path));
+
+                            match existing {
+                                None => {
+                                    // File exists but no DB record
+                                    result.unindexed.push(relative_path.clone());
+                                    if !dry_run {
+                                        if let Ok(_doc) = self.register_from_file(&path, docs_path) {
+                                            result.added += 1;
+                                        }
+                                    }
+                                }
+                                Some(doc) => {
+                                    // Check if stale
+                                    if doc.content_hash.as_ref() != Some(&parsed.content_hash) {
+                                        result.stale.push(relative_path.clone());
+                                        if !dry_run {
+                                            if let Some(id) = doc.id {
+                                                let _ = self.update_document_index(id, &parsed.content_hash);
+                                                // Also update status if it changed
+                                                if doc.status.to_lowercase() != parsed.status.to_lowercase() {
+                                                    let _ = self.update_document_status(dt, &doc.title, &parsed.status);
+                                                }
+                                                result.updated += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Check for orphan records
+            for doc in self.list_documents(dt).unwrap_or_default() {
+                if let Some(ref file_path) = doc.file_path {
+                    if !seen_files.contains(file_path) {
+                        let full_path = docs_path.join(file_path);
+                        if !full_path.exists() {
+                            result.orphaned.push(file_path.clone());
+                            if !dry_run {
+                                let _ = self.soft_delete_document(dt, &doc.title);
+                                result.soft_deleted += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     /// Update a document's status
@@ -1373,7 +1888,7 @@ impl DocumentStore {
             let now = chrono::Utc::now().to_rfc3339();
             let updated = self.conn.execute(
                 "UPDATE documents SET doc_type = ?1, number = ?2, title = ?3, status = ?4,
-                 file_path = ?5, updated_at = ?6 WHERE id = ?7",
+                 file_path = ?5, updated_at = ?6, content_hash = ?7, indexed_at = ?8 WHERE id = ?9",
                 params![
                     doc.doc_type.as_str(),
                     doc.number,
@@ -1381,8 +1896,29 @@ impl DocumentStore {
                     doc.status,
                     doc.file_path,
                     now,
+                    doc.content_hash,
+                    doc.indexed_at.as_ref().unwrap_or(&now),
                     id
                 ],
+            )?;
+            if updated == 0 {
+                return Err(StoreError::NotFound(format!("document #{}", id)));
+            }
+            Ok(())
+        })
+    }
+
+    /// Update a document's content hash and indexed_at timestamp (RFC 0018)
+    pub fn update_document_index(
+        &self,
+        id: i64,
+        content_hash: &str,
+    ) -> Result<(), StoreError> {
+        self.with_retry(|| {
+            let now = chrono::Utc::now().to_rfc3339();
+            let updated = self.conn.execute(
+                "UPDATE documents SET content_hash = ?1, indexed_at = ?2 WHERE id = ?3",
+                params![content_hash, now, id],
             )?;
             if updated == 0 {
                 return Err(StoreError::NotFound(format!("document #{}", id)));
@@ -1394,7 +1930,7 @@ impl DocumentStore {
     /// List all documents of a given type (excludes soft-deleted)
     pub fn list_documents(&self, doc_type: DocType) -> Result<Vec<Document>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, doc_type, number, title, status, file_path, created_at, updated_at, deleted_at
+            "SELECT id, doc_type, number, title, status, file_path, created_at, updated_at, deleted_at, content_hash, indexed_at
              FROM documents WHERE doc_type = ?1 AND deleted_at IS NULL ORDER BY number DESC, title ASC",
         )?;
 
@@ -1409,6 +1945,8 @@ impl DocumentStore {
                 created_at: row.get(6)?,
                 updated_at: row.get(7)?,
                 deleted_at: row.get(8)?,
+                content_hash: row.get(9)?,
+                indexed_at: row.get(10)?,
             })
         })?;
 
@@ -1423,7 +1961,7 @@ impl DocumentStore {
         status: &str,
     ) -> Result<Vec<Document>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, doc_type, number, title, status, file_path, created_at, updated_at, deleted_at
+            "SELECT id, doc_type, number, title, status, file_path, created_at, updated_at, deleted_at, content_hash, indexed_at
              FROM documents WHERE doc_type = ?1 AND status = ?2 AND deleted_at IS NULL ORDER BY number DESC, title ASC",
         )?;
 
@@ -1438,6 +1976,8 @@ impl DocumentStore {
                 created_at: row.get(6)?,
                 updated_at: row.get(7)?,
                 deleted_at: row.get(8)?,
+                content_hash: row.get(9)?,
+                indexed_at: row.get(10)?,
             })
         })?;
 
@@ -1499,7 +2039,7 @@ impl DocumentStore {
     pub fn get_deleted_document(&self, doc_type: DocType, title: &str) -> Result<Document, StoreError> {
         self.conn
             .query_row(
-                "SELECT id, doc_type, number, title, status, file_path, created_at, updated_at, deleted_at
+                "SELECT id, doc_type, number, title, status, file_path, created_at, updated_at, deleted_at, content_hash, indexed_at
                  FROM documents WHERE doc_type = ?1 AND title = ?2 AND deleted_at IS NOT NULL",
                 params![doc_type.as_str(), title],
                 |row| {
@@ -1513,6 +2053,8 @@ impl DocumentStore {
                         created_at: row.get(6)?,
                         updated_at: row.get(7)?,
                         deleted_at: row.get(8)?,
+                        content_hash: row.get(9)?,
+                        indexed_at: row.get(10)?,
                     })
                 },
             )
@@ -1530,12 +2072,12 @@ impl DocumentStore {
     pub fn list_deleted_documents(&self, doc_type: Option<DocType>) -> Result<Vec<Document>, StoreError> {
         let query = match doc_type {
             Some(dt) => format!(
-                "SELECT id, doc_type, number, title, status, file_path, created_at, updated_at, deleted_at
+                "SELECT id, doc_type, number, title, status, file_path, created_at, updated_at, deleted_at, content_hash, indexed_at
                  FROM documents WHERE doc_type = '{}' AND deleted_at IS NOT NULL
                  ORDER BY deleted_at DESC",
                 dt.as_str()
             ),
-            None => "SELECT id, doc_type, number, title, status, file_path, created_at, updated_at, deleted_at
+            None => "SELECT id, doc_type, number, title, status, file_path, created_at, updated_at, deleted_at, content_hash, indexed_at
                      FROM documents WHERE deleted_at IS NOT NULL
                      ORDER BY deleted_at DESC".to_string(),
         };
@@ -1552,6 +2094,8 @@ impl DocumentStore {
                 created_at: row.get(6)?,
                 updated_at: row.get(7)?,
                 deleted_at: row.get(8)?,
+                content_hash: row.get(9)?,
+                indexed_at: row.get(10)?,
             })
         })?;
 
@@ -1577,7 +2121,7 @@ impl DocumentStore {
     /// Check if a document has ADR dependents (documents that reference it via rfc_to_adr link)
     pub fn has_adr_dependents(&self, document_id: i64) -> Result<Vec<Document>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT d.id, d.doc_type, d.number, d.title, d.status, d.file_path, d.created_at, d.updated_at, d.deleted_at
+            "SELECT d.id, d.doc_type, d.number, d.title, d.status, d.file_path, d.created_at, d.updated_at, d.deleted_at, d.content_hash, d.indexed_at
              FROM documents d
              JOIN document_links l ON l.source_id = d.id
              WHERE l.target_id = ?1 AND l.link_type = 'rfc_to_adr' AND d.deleted_at IS NULL",
@@ -1594,6 +2138,8 @@ impl DocumentStore {
                 created_at: row.get(6)?,
                 updated_at: row.get(7)?,
                 deleted_at: row.get(8)?,
+                content_hash: row.get(9)?,
+                indexed_at: row.get(10)?,
             })
         })?;
 
@@ -1639,13 +2185,13 @@ impl DocumentStore {
     ) -> Result<Vec<Document>, StoreError> {
         let query = match link_type {
             Some(lt) => format!(
-                "SELECT d.id, d.doc_type, d.number, d.title, d.status, d.file_path, d.created_at, d.updated_at, d.deleted_at
+                "SELECT d.id, d.doc_type, d.number, d.title, d.status, d.file_path, d.created_at, d.updated_at, d.deleted_at, d.content_hash, d.indexed_at
                  FROM documents d
                  JOIN document_links l ON l.target_id = d.id
                  WHERE l.source_id = ?1 AND l.link_type = '{}' AND d.deleted_at IS NULL",
                 lt.as_str()
             ),
-            None => "SELECT d.id, d.doc_type, d.number, d.title, d.status, d.file_path, d.created_at, d.updated_at, d.deleted_at
+            None => "SELECT d.id, d.doc_type, d.number, d.title, d.status, d.file_path, d.created_at, d.updated_at, d.deleted_at, d.content_hash, d.indexed_at
                      FROM documents d
                      JOIN document_links l ON l.target_id = d.id
                      WHERE l.source_id = ?1 AND d.deleted_at IS NULL".to_string(),
@@ -1663,6 +2209,8 @@ impl DocumentStore {
                 created_at: row.get(6)?,
                 updated_at: row.get(7)?,
                 deleted_at: row.get(8)?,
+                content_hash: row.get(9)?,
+                indexed_at: row.get(10)?,
             })
         })?;
 
@@ -1903,7 +2451,7 @@ impl DocumentStore {
         let sql = match doc_type {
             Some(dt) => format!(
                 "SELECT d.id, d.doc_type, d.number, d.title, d.status, d.file_path,
-                        d.created_at, d.updated_at, d.deleted_at, bm25(documents_fts) as score
+                        d.created_at, d.updated_at, d.deleted_at, d.content_hash, d.indexed_at, bm25(documents_fts) as score
                  FROM documents_fts fts
                  JOIN documents d ON d.id = fts.rowid
                  WHERE documents_fts MATCH ?1 AND d.doc_type = '{}' AND d.deleted_at IS NULL
@@ -1912,7 +2460,7 @@ impl DocumentStore {
                 dt.as_str()
             ),
             None => "SELECT d.id, d.doc_type, d.number, d.title, d.status, d.file_path,
-                            d.created_at, d.updated_at, d.deleted_at, bm25(documents_fts) as score
+                            d.created_at, d.updated_at, d.deleted_at, d.content_hash, d.indexed_at, bm25(documents_fts) as score
                      FROM documents_fts fts
                      JOIN documents d ON d.id = fts.rowid
                      WHERE documents_fts MATCH ?1 AND d.deleted_at IS NULL
@@ -1934,8 +2482,10 @@ impl DocumentStore {
                     created_at: row.get(6)?,
                     updated_at: row.get(7)?,
                     deleted_at: row.get(8)?,
+                    content_hash: row.get(9)?,
+                    indexed_at: row.get(10)?,
                 },
-                score: row.get(9)?,
+                score: row.get(11)?,
                 snippet: None,
             })
         })?;

@@ -97,6 +97,23 @@ pub fn handle_resources_list(state: &ProjectState) -> Result<Value, ServerError>
         "mimeType": "text/markdown"
     }));
 
+    // Add plan files for in-progress RFCs (RFC 0019)
+    if let Ok(docs) = state.store.list_documents(blue_core::DocType::Rfc) {
+        for doc in docs.iter().filter(|d| d.status == "in-progress") {
+            if let Some(num) = doc.number {
+                let plan_path = blue_core::plan_file_path(&state.home.docs_path, &doc.title, num);
+                if plan_path.exists() {
+                    resources.push(json!({
+                        "uri": format!("blue://docs/rfcs/{}/plan", num),
+                        "name": format!("💙 Plan: {}", doc.title),
+                        "description": format!("Task plan for RFC {:04}", num),
+                        "mimeType": "text/markdown"
+                    }));
+                }
+            }
+        }
+    }
+
     Ok(json!({
         "resources": resources
     }))

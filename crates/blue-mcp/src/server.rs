@@ -1185,6 +1185,29 @@ impl BlueServer {
                         }
                     }
                 },
+                // RFC 0018: Document sync tool
+                {
+                    "name": "blue_sync",
+                    "description": "Reconcile database with filesystem. Scans .blue/docs/ for documents not in database and vice versa.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory"
+                            },
+                            "doc_type": {
+                                "type": "string",
+                                "description": "Limit to specific document type",
+                                "enum": ["rfc", "spike", "adr", "decision", "dialogue", "audit", "runbook", "postmortem", "prd"]
+                            },
+                            "dry_run": {
+                                "type": "boolean",
+                                "description": "Report drift without fixing (default: false)"
+                            }
+                        }
+                    }
+                },
                 // Phase 7: Environment isolation tools
                 {
                     "name": "blue_env_detect",
@@ -2163,6 +2186,8 @@ impl BlueServer {
             "blue_prd_list" => self.handle_prd_list(&call.arguments),
             // Phase 7: Lint handler
             "blue_lint" => self.handle_lint(&call.arguments),
+            // RFC 0018: Document sync handler
+            "blue_sync" => self.handle_sync(&call.arguments),
             // Phase 7: Environment handlers
             "blue_env_detect" => self.handle_env_detect(&call.arguments),
             "blue_env_mock" => self.handle_env_mock(&call.arguments),
@@ -2236,13 +2261,44 @@ impl BlueServer {
         match self.ensure_state() {
             Ok(state) => {
                 let summary = state.status_summary();
-                Ok(json!({
+
+                // Check for index drift across all doc types
+                let mut total_drift = 0;
+                let mut drift_details = serde_json::Map::new();
+
+                for doc_type in &[DocType::Rfc, DocType::Spike, DocType::Adr, DocType::Decision] {
+                    if let Ok(result) = state.store.reconcile(&state.home.docs_path, Some(*doc_type), true) {
+                        if result.has_drift() {
+                            total_drift += result.drift_count();
+                            drift_details.insert(
+                                format!("{:?}", doc_type).to_lowercase(),
+                                json!({
+                                    "unindexed": result.unindexed.len(),
+                                    "orphaned": result.orphaned.len(),
+                                    "stale": result.stale.len()
+                                })
+                            );
+                        }
+                    }
+                }
+
+                let mut response = json!({
                     "active": summary.active,
                     "ready": summary.ready,
                     "stalled": summary.stalled,
                     "drafts": summary.drafts,
                     "hint": summary.hint
-                }))
+                });
+
+                if total_drift > 0 {
+                    response["index_drift"] = json!({
+                        "total": total_drift,
+                        "by_type": drift_details,
+                        "hint": "Run blue_sync to reconcile."
+                    });
+                }
+
+                Ok(response)
             }
             Err(_) => {
                 // Fall back to a simple message if not in a Blue project
@@ -2463,7 +2519,27 @@ impl BlueServer {
         // Add plan file info if it exists
         if plan_path.exists() {
             response["plan_file"] = json!(plan_path.display().to_string());
+            response["_plan_uri"] = json!(format!("blue://docs/rfcs/{}/plan", rfc_number));
             response["cache_rebuilt"] = json!(cache_rebuilt);
+
+            // RFC 0019: Include Claude Code task format for auto-creation
+            let incomplete_tasks: Vec<_> = tasks.iter()
+                .filter(|t| !t.completed)
+                .map(|t| json!({
+                    "subject": format!("💙 {}", t.description),
+                    "description": format!("RFC: {}\nTask {} of {}", doc.title, t.task_index + 1, tasks.len()),
+                    "activeForm": format!("Working on: {}", t.description),
+                    "metadata": {
+                        "blue_rfc": doc.title,
+                        "blue_rfc_number": rfc_number,
+                        "blue_task_index": t.task_index
+                    }
+                }))
+                .collect();
+
+            if !incomplete_tasks.is_empty() {
+                response["claude_code_tasks"] = json!(incomplete_tasks);
+            }
         }
 
         Ok(response)
@@ -3141,6 +3217,65 @@ impl BlueServer {
         let args = args.as_ref().unwrap_or(&empty);
         let state = self.ensure_state()?;
         crate::handlers::lint::handle_lint(args, &state.home.root)
+    }
+
+    // RFC 0018: Document sync handler
+    fn handle_sync(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let empty = json!({});
+        let args = args.as_ref().unwrap_or(&empty);
+
+        let doc_type = args.get("doc_type")
+            .and_then(|v| v.as_str())
+            .and_then(DocType::from_str);
+
+        let dry_run = args.get("dry_run")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let state = self.ensure_state()?;
+
+        let result = state.store.reconcile(&state.home.docs_path, doc_type, dry_run)
+            .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
+
+        let message = if dry_run {
+            if result.has_drift() {
+                blue_core::voice::info(
+                    &format!(
+                        "Found {} issues: {} unindexed, {} orphaned, {} stale",
+                        result.drift_count(),
+                        result.unindexed.len(),
+                        result.orphaned.len(),
+                        result.stale.len()
+                    ),
+                    Some("Run without --dry-run to fix.")
+                )
+            } else {
+                blue_core::voice::success("No drift detected. Database and filesystem in sync.", None)
+            }
+        } else if result.added > 0 || result.updated > 0 || result.soft_deleted > 0 {
+            blue_core::voice::success(
+                &format!(
+                    "Synced: {} added, {} updated, {} soft-deleted",
+                    result.added, result.updated, result.soft_deleted
+                ),
+                None
+            )
+        } else {
+            blue_core::voice::success("Already in sync.", None)
+        };
+
+        Ok(json!({
+            "status": "success",
+            "message": message,
+            "dry_run": dry_run,
+            "unindexed": result.unindexed,
+            "orphaned": result.orphaned,
+            "stale": result.stale,
+            "added": result.added,
+            "updated": result.updated,
+            "soft_deleted": result.soft_deleted,
+            "has_drift": result.has_drift()
+        }))
     }
 
     // Phase 7: Environment handlers

@@ -100,6 +100,8 @@ pub fn handle_create(state: &mut ProjectState, args: &Value) -> Result<Value, Se
         created_at: None,
         updated_at: None,
         deleted_at: None,
+        content_hash: Some(blue_core::store::hash_content(&markdown)),
+        indexed_at: None,
     };
     state
         .store
@@ -216,6 +218,8 @@ pub fn handle_action_to_rfc(state: &mut ProjectState, args: &Value) -> Result<Va
         created_at: None,
         updated_at: None,
         deleted_at: None,
+        content_hash: Some(blue_core::store::hash_content(&markdown)),
+        indexed_at: None,
     };
     state
         .store
