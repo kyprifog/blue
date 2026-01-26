@@ -14,6 +14,16 @@ use serde_json::{json, Value};
 
 use crate::error::ServerError;
 
+/// Coerce a JSON value to bool, accepting both `true` and `"true"`.
+/// MCP clients sometimes send booleans as strings.
+fn coerce_bool(v: &Value) -> Option<bool> {
+    v.as_bool().or_else(|| match v.as_str() {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ => None,
+    })
+}
+
 // ==================== Alignment Mode Types ====================
 
 /// A pastry-themed expert agent for alignment dialogues
@@ -304,7 +314,7 @@ pub fn handle_create(state: &mut ProjectState, args: &Value) -> Result<Value, Se
     // Alignment mode params
     let alignment = args
         .get("alignment")
-        .and_then(|v| v.as_bool())
+        .and_then(coerce_bool)
         .unwrap_or(false);
     let agent_count = args
         .get("agents")
@@ -970,11 +980,31 @@ Use the Write tool to write your COMPLETE response to:
   {{{{OUTPUT_FILE}}}}
 
 Write your full perspective to this file. This is your primary output mechanism.
-After writing the file, you may stop.{source_read_instructions}"##
+
+RETURN SUMMARY — THIS IS MANDATORY:
+After writing the file, return a brief summary to the Judge:
+- Key perspective(s) raised (P01, P02...)
+- Tension(s) identified (T01, T02...)
+- Concession(s) made
+This ensures the Judge can synthesize without re-reading your full file.{source_read_instructions}"##
     );
 
     let instructions = format!(
         r##"You are the 💙 Judge. Orchestrate this alignment dialogue.
+
+=== FILE ARCHITECTURE (RFC 0033) ===
+
+```
+{output_dir}/
+├─ scoreboard.md              ← You write + read (~500 bytes)
+├─ tensions.md                ← You write, agents read (~1-2KB)
+├─ round-0/
+│  └─ {{agent}}.md            ← Agents write, peers read (~2-3KB each)
+├─ round-0.summary.md         ← You write, agents read (~1-2KB)
+└─ round-1/...
+```
+
+Every file has exactly one writer and at least one reader.
 
 === HOW TO SPAWN EXPERT SUBAGENTS ===
 
@@ -990,27 +1020,35 @@ Each Task call:
 - max_turns: 10
 - prompt: the AGENT PROMPT TEMPLATE with {{{{NAME}}}}, {{{{EMOJI}}}}, {{{{ROLE}}}}, {{{{OUTPUT_FILE}}}} substituted
   - {{{{OUTPUT_FILE}}}} → {output_dir}/round-N/AGENT_NAME_LOWERCASE.md
-- run_in_background: true
 
-All {agent_count} results return when complete.
+All {agent_count} results return when complete WITH SUMMARIES (key perspectives, tensions, concessions).
 
 === ROUND WORKFLOW ===
 
 1. MKDIR: Create round directory via Bash: mkdir -p {output_dir}/round-N
 2. SPAWN: One message, {agent_count} Task calls (parallel subagents)
-3. READ: After all agents complete, read each file with Read tool
-   If a file is missing, fall back to blue_extract_dialogue(task_id=TASK_ID)
+3. COLLECT: Agents return summaries — use these for synthesis (avoid re-reading full files)
+   If summary is insufficient, read the file with Read tool as fallback
 4. SCORE: ALIGNMENT = Wisdom + Consistency + Truth + Relationships (UNBOUNDED)
-   - Score ONLY AFTER reading output — NEVER pre-fill scores
-5. UPDATE {dialogue_file}:
+   - Score ONLY AFTER reading agent returns — NEVER pre-fill scores
+5. WRITE ARTIFACTS:
+   - Update scoreboard.md with new scores
+   - Update tensions.md with new/resolved tensions
+   - Write round-N.summary.md with your synthesis
+6. UPDATE {dialogue_file}:
    - Agent responses under the correct Round section
    - Scoreboard with scores from this round
    - Perspectives Inventory (one row per [PERSPECTIVE Pnn:] marker)
    - Tensions Tracker (one row per [TENSION Tn:] marker)
-6. CONVERGE: If velocity approaches 0 OR all tensions resolved → declare convergence
-   Otherwise, start next round with updated prompt including prior perspectives
+7. CONVERGE: If velocity approaches 0 OR all tensions resolved → declare convergence
+   Otherwise, start next round with updated prompt including prior summary
    Maximum 5 rounds (safety valve)
-7. SAVE via blue_dialogue_save
+
+=== TOKEN BUDGET ===
+
+Your reads per round: ~5KB (scoreboard + tensions + prior summary)
+Agent reads per round: ~15KB (tensions + peer files + prior summary)
+Both well under 25K limit. Opus usage minimized.
 
 AGENTS: {agent_names}
 OUTPUT DIR: {output_dir}
@@ -1020,7 +1058,7 @@ FORMAT RULES — MANDATORY:
 - The Judge is 💙 Judge — always include the 💙
 - Expert Panel table columns: Agent | Role | Tier | Relevance | Emoji
 - Round headers use emoji prefix (### 🧁 Muffin)
-- Scores start at 0 — only fill after reading round output
+- Scores start at 0 — only fill after reading agent returns
 
 IMPORTANT: Each agent has NO memory of other agents. They see only the topic and their role."##,
         agent_count = agents.len(),
