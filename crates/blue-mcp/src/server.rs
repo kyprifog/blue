@@ -2397,20 +2397,50 @@ impl BlueServer {
         let doc = state.store.find_document(DocType::Rfc, title)
             .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
 
+        let doc_id = doc.id;
+        let rfc_number = doc.number.unwrap_or(0);
+
+        // RFC 0017: Check if plan file exists and cache is stale - rebuild if needed
+        let plan_path = blue_core::plan_file_path(&state.home.docs_path, title, rfc_number);
+        let mut cache_rebuilt = false;
+
+        if let Some(id) = doc_id {
+            if plan_path.exists() {
+                let cache_mtime = state.store.get_plan_cache_mtime(id)
+                    .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
+
+                if blue_core::is_cache_stale(&plan_path, cache_mtime.as_deref()) {
+                    // Rebuild cache from plan file
+                    let plan = blue_core::read_plan_file(&plan_path)
+                        .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
+
+                    state.store.rebuild_tasks_from_plan(id, &plan.tasks)
+                        .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
+
+                    // Update cache mtime
+                    let mtime = chrono::Utc::now().to_rfc3339();
+                    state.store.update_plan_cache_mtime(id, &mtime)
+                        .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
+
+                    cache_rebuilt = true;
+                }
+            }
+        }
+
         // Get tasks if any
-        let tasks = if let Some(id) = doc.id {
+        let tasks = if let Some(id) = doc_id {
             state.store.get_tasks(id).unwrap_or_default()
         } else {
             vec![]
         };
 
-        let progress = if let Some(id) = doc.id {
+        let progress = if let Some(id) = doc_id {
             state.store.get_task_progress(id).ok()
         } else {
             None
         };
 
-        Ok(json!({
+        let mut response = json!({
             "id": doc.id,
             "number": doc.number,
             "title": doc.title,
@@ -2428,7 +2458,15 @@ impl BlueServer {
                 "total": p.total,
                 "percentage": p.percentage
             }))
-        }))
+        });
+
+        // Add plan file info if it exists
+        if plan_path.exists() {
+            response["plan_file"] = json!(plan_path.display().to_string());
+            response["cache_rebuilt"] = json!(cache_rebuilt);
+        }
+
+        Ok(response)
     }
 
     fn handle_rfc_update_status(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
@@ -2553,15 +2591,59 @@ impl BlueServer {
 
         let doc_id = doc.id.ok_or(ServerError::InvalidParams)?;
 
+        // RFC 0017: Status gating - only allow planning for accepted or in-progress RFCs
+        let status_lower = doc.status.to_lowercase();
+        if status_lower != "accepted" && status_lower != "in-progress" {
+            return Err(ServerError::Workflow(format!(
+                "RFC must be 'accepted' or 'in-progress' to create a plan (current: {})",
+                doc.status
+            )));
+        }
+
+        // RFC 0017: Write .plan.md file as authoritative source
+        let plan_tasks: Vec<blue_core::PlanTask> = tasks
+            .iter()
+            .map(|desc| blue_core::PlanTask {
+                description: desc.clone(),
+                completed: false,
+            })
+            .collect();
+
+        let plan = blue_core::PlanFile {
+            rfc_title: title.to_string(),
+            status: blue_core::PlanStatus::InProgress,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            tasks: plan_tasks.clone(),
+        };
+
+        let rfc_number = doc.number.unwrap_or(0);
+        let plan_path = blue_core::plan_file_path(&state.home.docs_path, title, rfc_number);
+
+        // Ensure parent directory exists
+        if let Some(parent) = plan_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| ServerError::StateLoadFailed(format!("Failed to create directory: {}", e)))?;
+        }
+
+        blue_core::write_plan_file(&plan_path, &plan)
+            .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
+
+        // Update SQLite cache
         state.store.set_tasks(doc_id, &tasks)
+            .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
+
+        // Update cache mtime
+        let mtime = chrono::Utc::now().to_rfc3339();
+        state.store.update_plan_cache_mtime(doc_id, &mtime)
             .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
 
         Ok(json!({
             "status": "success",
             "title": title,
             "task_count": tasks.len(),
+            "plan_file": plan_path.display().to_string(),
             "message": blue_core::voice::success(
-                &format!("Set {} tasks for '{}'", tasks.len(), title),
+                &format!("Set {} tasks for '{}'. Plan file created.", tasks.len(), title),
                 Some("Mark them complete as you go with blue_rfc_task_complete.")
             )
         }))
@@ -2586,23 +2668,58 @@ impl BlueServer {
             .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
 
         let doc_id = doc.id.ok_or(ServerError::InvalidParams)?;
+        let rfc_number = doc.number.unwrap_or(0);
+
+        // RFC 0017: Check if .plan.md exists and use it as authority
+        let plan_path = blue_core::plan_file_path(&state.home.docs_path, title, rfc_number);
 
         // Parse task index or find by substring
         let task_index = if let Ok(idx) = task.parse::<i32>() {
             idx
         } else {
-            // Find task by substring
-            let tasks = state.store.get_tasks(doc_id)
-                .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
+            // Find task by substring - check plan file first if it exists
+            if plan_path.exists() {
+                let plan = blue_core::read_plan_file(&plan_path)
+                    .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
 
-            tasks.iter()
-                .find(|t| t.description.to_lowercase().contains(&task.to_lowercase()))
-                .map(|t| t.task_index)
-                .ok_or(ServerError::InvalidParams)?
+                plan.tasks
+                    .iter()
+                    .position(|t| t.description.to_lowercase().contains(&task.to_lowercase()))
+                    .map(|idx| idx as i32)
+                    .ok_or(ServerError::InvalidParams)?
+            } else {
+                // Fall back to SQLite
+                let tasks = state.store.get_tasks(doc_id)
+                    .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
+
+                tasks.iter()
+                    .find(|t| t.description.to_lowercase().contains(&task.to_lowercase()))
+                    .map(|t| t.task_index)
+                    .ok_or(ServerError::InvalidParams)?
+            }
         };
 
-        state.store.complete_task(doc_id, task_index)
-            .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
+        // RFC 0017: Update .plan.md if it exists
+        let plan_updated = if plan_path.exists() {
+            let updated_plan = blue_core::update_task_in_plan(&plan_path, task_index as usize, true)
+                .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
+
+            // Rebuild SQLite cache from plan
+            state.store.rebuild_tasks_from_plan(doc_id, &updated_plan.tasks)
+                .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
+
+            // Update cache mtime
+            let mtime = chrono::Utc::now().to_rfc3339();
+            state.store.update_plan_cache_mtime(doc_id, &mtime)
+                .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
+
+            true
+        } else {
+            // No plan file - update SQLite directly (legacy behavior)
+            state.store.complete_task(doc_id, task_index)
+                .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
+            false
+        };
 
         let progress = state.store.get_task_progress(doc_id)
             .map_err(|e| ServerError::StateLoadFailed(e.to_string()))?;
@@ -2611,6 +2728,7 @@ impl BlueServer {
             "status": "success",
             "title": title,
             "task_index": task_index,
+            "plan_updated": plan_updated,
             "progress": {
                 "completed": progress.completed,
                 "total": progress.total,

@@ -10,7 +10,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use tracing::{debug, info, warn};
 
 /// Current schema version
-const SCHEMA_VERSION: i32 = 6;
+const SCHEMA_VERSION: i32 = 7;
 
 /// Core database schema
 const SCHEMA: &str = r#"
@@ -1125,6 +1125,26 @@ impl DocumentStore {
             )?;
         }
 
+        // Migration from v6 to v7: Add plan_cache table (RFC 0017 - Plan File Authority)
+        if from_version < 7 {
+            debug!("Adding plan_cache table (RFC 0017)");
+
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS plan_cache (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    document_id INTEGER NOT NULL UNIQUE,
+                    cache_mtime TEXT NOT NULL,
+                    FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+                )",
+                [],
+            )?;
+
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_plan_cache_document ON plan_cache(document_id)",
+                [],
+            )?;
+        }
+
         // Update schema version
         self.conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -1732,6 +1752,68 @@ impl DocumentStore {
 
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::Database)
+    }
+
+    // ==================== Plan Cache Operations (RFC 0017) ====================
+
+    /// Get the cached mtime for a plan file
+    pub fn get_plan_cache_mtime(&self, document_id: i64) -> Result<Option<String>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT cache_mtime FROM plan_cache WHERE document_id = ?1",
+                params![document_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::Database)
+    }
+
+    /// Update the cached mtime for a plan file
+    pub fn update_plan_cache_mtime(&self, document_id: i64, mtime: &str) -> Result<(), StoreError> {
+        self.with_retry(|| {
+            self.conn.execute(
+                "INSERT INTO plan_cache (document_id, cache_mtime) VALUES (?1, ?2)
+                 ON CONFLICT(document_id) DO UPDATE SET cache_mtime = excluded.cache_mtime",
+                params![document_id, mtime],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Rebuild tasks from plan file data (RFC 0017 - authority inversion)
+    pub fn rebuild_tasks_from_plan(
+        &self,
+        document_id: i64,
+        tasks: &[crate::plan::PlanTask],
+    ) -> Result<(), StoreError> {
+        self.with_retry(|| {
+            // Delete existing tasks
+            self.conn
+                .execute("DELETE FROM tasks WHERE document_id = ?1", params![document_id])?;
+
+            // Insert tasks from plan file
+            for (index, task) in tasks.iter().enumerate() {
+                let completed_at = if task.completed {
+                    Some(chrono::Utc::now().to_rfc3339())
+                } else {
+                    None
+                };
+
+                self.conn.execute(
+                    "INSERT INTO tasks (document_id, task_index, description, completed, completed_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        document_id,
+                        index as i32,
+                        task.description,
+                        task.completed as i32,
+                        completed_at
+                    ],
+                )?;
+            }
+
+            Ok(())
+        })
     }
 
     // ==================== Worktree Operations ====================
