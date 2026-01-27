@@ -222,6 +222,16 @@ const SCHEMA: &str = r#"
         doc_type,
         updated_at
     ) WHERE deleted_at IS NULL;
+
+    -- Plan cache for tracking plan file sync state (RFC 0017)
+    CREATE TABLE IF NOT EXISTS plan_cache (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        document_id INTEGER NOT NULL UNIQUE,
+        cache_mtime TEXT NOT NULL,
+        FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_plan_cache_document ON plan_cache(document_id);
 "#;
 
 /// FTS5 schema for full-text search
