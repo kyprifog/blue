@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | Implemented |
 | **Date** | 2026-01-30 |
 | **Related** | RFC 0016 (Context Injection Architecture), RFC 0038 (SDLC Workflow Discipline) |
 | **Problem** | SDLC discipline drift after conversation compaction |
