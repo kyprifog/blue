@@ -21,7 +21,10 @@ pub use contract::{
     Compatibility, Contract, ContractValue, EvolutionEntry, ValidationConfig,
 };
 pub use domain::{Binding, BindingRole, Domain, ExportBinding, ImportBinding, ImportStatus};
-pub use repo::{LocalRepoConfig, RealmRef, RepoConfig};
+pub use repo::{
+    LocalRealmDependencies, LocalRealmMembership, LocalRepoConfig, RealmRef, RepoConfig,
+    RfcDependencies,
+};
 pub use service::{
     CheckIssue, CheckIssueKind, CheckResult, DomainDetails, RealmDetails, RealmInfo,
     RealmService, RealmSyncStatus, SyncResult, WorktreeInfo, WorktreePrStatus,

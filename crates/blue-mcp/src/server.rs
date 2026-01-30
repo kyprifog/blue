@@ -13,6 +13,33 @@ use blue_core::{detect_blue, DocType, Document, ProjectState, Rfc, RfcStatus, ti
 
 use crate::error::ServerError;
 
+/// Parse | **Source Spike** | spike-title | from RFC frontmatter (RFC 0038)
+fn parse_source_spike(content: &str) -> Option<String> {
+    let pattern = regex::Regex::new(r"\| \*\*Source Spike\*\* \| ([^|]+) \|").ok()?;
+    let caps = pattern.captures(content)?;
+    Some(caps.get(1)?.as_str().trim().to_string())
+}
+
+/// Parse | **Produces RFCs** | 0038, 0039 | from spike frontmatter (RFC 0038)
+fn parse_produces_rfcs(content: &str) -> Vec<String> {
+    let pattern = regex::Regex::new(r"\| \*\*Produces RFCs\*\* \| ([^|]+) \|").ok();
+    match pattern {
+        Some(re) => {
+            if let Some(caps) = re.captures(content) {
+                if let Some(m) = caps.get(1) {
+                    return m.as_str()
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                }
+            }
+            Vec::new()
+        }
+        None => Vec::new(),
+    }
+}
+
 /// Blue MCP Server state
 pub struct BlueServer {
     /// Current working directory (set explicitly via tool args)
@@ -1905,6 +1932,24 @@ impl BlueServer {
                         "required": ["cwd"]
                     }
                 },
+                // RFC 0038: Realm RFC Validation
+                {
+                    "name": "blue_rfc_validate_realm",
+                    "description": "Validate cross-repo RFC dependencies defined in .blue/realm.toml. Returns status matrix showing resolved/unresolved dependencies. Use --strict to fail on unresolved deps.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory"
+                            },
+                            "strict": {
+                                "type": "boolean",
+                                "description": "Fail if any dependencies are unresolved (default: false, just warn)"
+                            }
+                        }
+                    }
+                },
                 // RFC 0005: Local LLM Integration
                 {
                     "name": "blue_llm_start",
@@ -2363,6 +2408,8 @@ impl BlueServer {
             "blue_realm_worktree_create" => self.handle_realm_worktree_create(&call.arguments),
             "blue_realm_pr_status" => self.handle_realm_pr_status(&call.arguments),
             "blue_notifications_list" => self.handle_notifications_list(&call.arguments),
+            // RFC 0038: Realm RFC Validation
+            "blue_rfc_validate_realm" => self.handle_validate_realm(&call.arguments),
             // RFC 0005: LLM tools
             "blue_llm_start" => crate::handlers::llm::handle_start(&call.arguments.unwrap_or_default()),
             "blue_llm_stop" => crate::handlers::llm::handle_stop(),
@@ -2749,6 +2796,20 @@ impl BlueServer {
             false
         };
 
+        // RFC 0038: Auto-close source spike when RFC transitions to implemented
+        let spike_closed = if status_str == "implemented" {
+            self.try_close_source_spike(title, &doc)
+        } else {
+            None
+        };
+
+        // RFC 0038: Suggest relevant ADRs when RFC transitions to in-progress
+        let adr_suggestions = if status_str == "in-progress" {
+            self.get_adr_suggestions(title)
+        } else {
+            None
+        };
+
         // Conversational hints guide Claude to next action (RFC 0014)
         let hint = match target_status {
             RfcStatus::Accepted => Some(
@@ -2797,8 +2858,145 @@ impl BlueServer {
         if let Some(warning) = worktree_warning {
             response["warning"] = json!(warning);
         }
+        // RFC 0038: Include spike closure info
+        if let Some(spike_info) = spike_closed {
+            response["spike_closed"] = spike_info;
+        }
+        // RFC 0038: Include ADR suggestions
+        if let Some(adrs) = adr_suggestions {
+            response["adr_suggestions"] = adrs;
+        }
 
         Ok(response)
+    }
+
+    /// RFC 0038: Try to close the source spike when RFC is implemented
+    fn try_close_source_spike(&self, _rfc_title: &str, rfc_doc: &Document) -> Option<Value> {
+        let state = self.state.as_ref()?;
+
+        // Read RFC file to extract source spike
+        let rfc_file_path = rfc_doc.file_path.as_ref()?;
+        let full_path = state.home.docs_path.join(rfc_file_path);
+        let content = fs::read_to_string(&full_path).ok()?;
+
+        // Parse | **Source Spike** | spike-title | from RFC frontmatter
+        let source_spike = parse_source_spike(&content)?;
+
+        // Find the spike document
+        let spike_doc = state.store.find_document(DocType::Spike, &source_spike).ok()?;
+
+        // Check if spike has produces_rfcs field - if so, verify all are resolved
+        if let Some(spike_path) = &spike_doc.file_path {
+            let spike_full_path = state.home.docs_path.join(spike_path);
+            if let Ok(spike_content) = fs::read_to_string(&spike_full_path) {
+                let produces_rfcs = parse_produces_rfcs(&spike_content);
+
+                if !produces_rfcs.is_empty() {
+                    // Check if ALL produced RFCs are resolved (implemented or superseded)
+                    let mut all_resolved = true;
+                    let mut pending_rfcs = Vec::new();
+
+                    for rfc_ref in &produces_rfcs {
+                        // Handle cross-repo references (e.g., "blue-web:0015")
+                        let (repo, rfc_id) = if rfc_ref.contains(':') {
+                            let parts: Vec<&str> = rfc_ref.splitn(2, ':').collect();
+                            (Some(parts[0]), parts[1])
+                        } else {
+                            (None, rfc_ref.as_str())
+                        };
+
+                        // For now, only handle local RFCs
+                        if repo.is_some() {
+                            continue; // Skip cross-repo for now
+                        }
+
+                        // Find the RFC by number or title
+                        if let Ok(doc) = state.store.find_document(DocType::Rfc, rfc_id) {
+                            let status = doc.status.to_lowercase();
+                            if status != "implemented" && status != "superseded" {
+                                all_resolved = false;
+                                pending_rfcs.push(rfc_id.to_string());
+                            }
+                        } else {
+                            // RFC not found - don't block spike closure
+                        }
+                    }
+
+                    if !all_resolved {
+                        return Some(json!({
+                            "status": "partial",
+                            "spike": source_spike,
+                            "message": format!("Spike '{}' has pending RFCs: {}", source_spike, pending_rfcs.join(", ")),
+                            "pending_rfcs": pending_rfcs
+                        }));
+                    }
+                }
+            }
+        }
+
+        // All checks passed - close the spike
+        let _ = state.store.update_document_status(DocType::Spike, &source_spike, "complete");
+
+        // Rename spike file (.wip.md -> .done.md) via RFC 0031
+        if let Ok(Some(new_path)) = blue_core::rename_for_status(
+            &state.home.docs_path,
+            &state.store,
+            &spike_doc,
+            "complete"
+        ) {
+            let full_new_path = state.home.docs_path.join(&new_path);
+            let _ = blue_core::update_markdown_status(&full_new_path, "complete");
+        }
+
+        Some(json!({
+            "status": "closed",
+            "spike": source_spike,
+            "message": format!("Auto-closed spike '{}' - all produced RFCs are resolved", source_spike)
+        }))
+    }
+
+    /// RFC 0038: Get ADR suggestions for an RFC transitioning to in-progress
+    fn get_adr_suggestions(&self, rfc_title: &str) -> Option<Value> {
+        let state = self.state.as_ref()?;
+
+        // Use the existing ADR relevance handler
+        let args = json!({ "context": rfc_title });
+        let result = crate::handlers::adr::handle_relevant(state, &args).ok()?;
+
+        // Extract relevant ADRs with high confidence
+        let relevant = result.get("relevant")?.as_array()?;
+        if relevant.is_empty() {
+            return None;
+        }
+
+        // Filter to ADRs with confidence > 0.7
+        let high_confidence: Vec<&Value> = relevant
+            .iter()
+            .filter(|adr| {
+                adr.get("confidence")
+                    .and_then(|c| c.as_f64())
+                    .unwrap_or(0.0) > 0.7
+            })
+            .collect();
+
+        if high_confidence.is_empty() {
+            return None;
+        }
+
+        // Check for architectural keywords that suggest a new ADR might be needed
+        let title_lower = rfc_title.to_lowercase();
+        let architectural_keywords = ["breaking", "redesign", "architectural", "migration", "refactor"];
+        let suggests_new_adr = architectural_keywords.iter().any(|kw| title_lower.contains(kw));
+
+        Some(json!({
+            "relevant_adrs": high_confidence,
+            "suggests_new_adr": suggests_new_adr,
+            "hint": if suggests_new_adr {
+                "This RFC may warrant a new ADR after implementation. Consider using blue_adr_create."
+            } else {
+                "Review these ADRs while implementing."
+            }
+        }))
     }
 
     fn handle_rfc_plan(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
@@ -3634,6 +3832,16 @@ impl BlueServer {
             .and_then(|a| a.get("state"))
             .and_then(|v| v.as_str());
         crate::handlers::realm::handle_notifications_list(self.cwd.as_deref(), state)
+    }
+
+    // RFC 0038: Realm RFC Validation
+    fn handle_validate_realm(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let strict = args
+            .as_ref()
+            .and_then(|a| a.get("strict"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        crate::handlers::realm::handle_validate_realm(self.cwd.as_deref(), strict)
     }
 
     // RFC 0006: Delete handlers

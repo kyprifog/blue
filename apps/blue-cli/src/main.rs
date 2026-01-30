@@ -122,6 +122,17 @@ enum Commands {
         #[command(subcommand)]
         command: Option<ContextCommands>,
     },
+
+    /// Guard: Check if file writes are allowed (RFC 0038 PreToolUse hook)
+    Guard {
+        /// Path to check
+        #[arg(long)]
+        path: String,
+
+        /// Tool that triggered the check (for audit logging)
+        #[arg(long)]
+        tool: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -518,6 +529,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Context { command }) => {
             handle_context_command(command).await?;
+        }
+        Some(Commands::Guard { path, tool }) => {
+            handle_guard_command(&path, tool.as_deref()).await?;
         }
     }
 
@@ -2223,5 +2237,225 @@ fn print_context_verbose(manifest: &blue_core::ContextManifest, resolution: &blu
                 }
             }
         }
+    }
+}
+
+// ==================== Guard Command (RFC 0038) ====================
+
+/// Check if file write is allowed based on worktree and allowlist rules.
+///
+/// Exit codes:
+/// - 0: Allow the write
+/// - 1: Block the write (not in valid worktree and not in allowlist)
+async fn handle_guard_command(path: &str, tool: Option<&str>) -> Result<()> {
+    use std::path::Path;
+
+    // Check for bypass environment variable
+    if std::env::var("BLUE_BYPASS_WORKTREE").is_ok() {
+        // Log bypass for audit
+        log_guard_bypass(path, tool, "BLUE_BYPASS_WORKTREE env set");
+        return Ok(()); // Exit 0 = allow
+    }
+
+    let path = Path::new(path);
+
+    // Check allowlist patterns first (fast path)
+    if is_in_allowlist(path) {
+        return Ok(()); // Exit 0 = allow
+    }
+
+    // Get current working directory
+    let cwd = std::env::current_dir()?;
+
+    // Check if we're in a git worktree
+    let worktree_info = get_worktree_info(&cwd)?;
+
+    match worktree_info {
+        Some(info) => {
+            // We're in a worktree - check if it's associated with an RFC
+            if info.is_rfc_worktree {
+                // Check if the path is inside this worktree
+                let abs_path = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    cwd.join(path)
+                };
+
+                if abs_path.starts_with(&info.worktree_path) {
+                    return Ok(()); // Exit 0 = allow writes in RFC worktree
+                }
+            }
+            // Not in allowlist and not in RFC worktree scope
+            eprintln!("guard: blocked write to {} (not in RFC worktree scope)", path.display());
+            std::process::exit(1);
+        }
+        None => {
+            // Not in a worktree - check if there's an active RFC that might apply
+            // For now, block writes to source code outside worktrees
+            if is_source_code_path(path) {
+                eprintln!("guard: blocked write to {} (no active worktree)", path.display());
+                eprintln!("hint: Create a worktree with 'blue worktree create <rfc-title>' first");
+                std::process::exit(1);
+            }
+            // Non-source-code files are allowed
+            Ok(())
+        }
+    }
+}
+
+/// Allowlist patterns for files that can always be written
+fn is_in_allowlist(path: &std::path::Path) -> bool {
+    let path_str = path.to_string_lossy();
+
+    // Always-allowed patterns
+    let allowlist = [
+        ".blue/docs/",      // Blue documentation
+        ".claude/",         // Claude configuration
+        "/tmp/",            // Temp files
+        "*.md",             // Markdown at root (but not in crates/)
+        ".gitignore",       // Git config
+        ".blue/audit/",     // Audit logs
+    ];
+
+    for pattern in &allowlist {
+        if pattern.starts_with("*.") {
+            // Extension pattern - check only root level
+            let ext = &pattern[1..];
+            if path_str.ends_with(ext) && !path_str.contains("crates/") && !path_str.contains("src/") {
+                return true;
+            }
+        } else if path_str.contains(pattern) {
+            return true;
+        }
+    }
+
+    // Check for dialogue temp files
+    if path_str.contains("/tmp/blue-dialogue/") {
+        return true;
+    }
+
+    false
+}
+
+/// Check if a path looks like source code
+fn is_source_code_path(path: &std::path::Path) -> bool {
+    let path_str = path.to_string_lossy();
+
+    // Source code indicators
+    let source_patterns = [
+        "src/",
+        "crates/",
+        "apps/",
+        "lib/",
+        "packages/",
+        "tests/",
+    ];
+
+    for pattern in &source_patterns {
+        if path_str.contains(pattern) {
+            return true;
+        }
+    }
+
+    // Check file extensions
+    if let Some(ext) = path.extension().and_then(|e: &std::ffi::OsStr| e.to_str()) {
+        let code_extensions = ["rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "c", "cpp", "h"];
+        if code_extensions.contains(&ext) {
+            return true;
+        }
+    }
+
+    false
+}
+
+struct WorktreeInfo {
+    worktree_path: std::path::PathBuf,
+    is_rfc_worktree: bool,
+}
+
+/// Get information about the current git worktree
+fn get_worktree_info(cwd: &std::path::Path) -> Result<Option<WorktreeInfo>> {
+    // Check if we're in a git worktree by looking at .git file
+    let git_path = cwd.join(".git");
+
+    if git_path.is_file() {
+        // This is a worktree (linked worktree has .git as a file)
+        let content = std::fs::read_to_string(&git_path)?;
+        if content.starts_with("gitdir:") {
+            // Parse the worktree path
+            let worktree_path = cwd.to_path_buf();
+
+            // Check if this looks like an RFC worktree
+            // RFC worktrees are typically named feature/<rfc-slug> or rfc/<rfc-slug>
+            let dir_name = cwd.file_name()
+                .and_then(|n: &std::ffi::OsStr| n.to_str())
+                .unwrap_or("");
+
+            let parent_is_worktrees = cwd.parent()
+                .and_then(|p: &std::path::Path| p.file_name())
+                .and_then(|n: &std::ffi::OsStr| n.to_str())
+                .map(|s: &str| s == "worktrees")
+                .unwrap_or(false);
+
+            let is_rfc = dir_name.starts_with("rfc-")
+                || dir_name.starts_with("feature-")
+                || parent_is_worktrees;
+
+            return Ok(Some(WorktreeInfo {
+                worktree_path,
+                is_rfc_worktree: is_rfc,
+            }));
+        }
+    } else if git_path.is_dir() {
+        // Main repository - check if we're on an RFC branch
+        let output = std::process::Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(cwd)
+            .output();
+
+        if let Ok(output) = output {
+            let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let is_rfc = branch.starts_with("feature/")
+                || branch.starts_with("rfc/")
+                || branch.starts_with("rfc-");
+
+            return Ok(Some(WorktreeInfo {
+                worktree_path: cwd.to_path_buf(),
+                is_rfc_worktree: is_rfc,
+            }));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Log a guard bypass for audit trail
+fn log_guard_bypass(path: &str, tool: Option<&str>, reason: &str) {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(_) => return,
+    };
+
+    let audit_dir = cwd.join(".blue").join("audit");
+    if std::fs::create_dir_all(&audit_dir).is_err() {
+        return;
+    }
+
+    let log_path = audit_dir.join("guard-bypass.log");
+    let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    let tool_str = tool.unwrap_or("unknown");
+    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+
+    let entry = format!("{} | {} | {} | {} | {}\n", timestamp, user, tool_str, path, reason);
+
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        let _ = file.write_all(entry.as_bytes());
     }
 }

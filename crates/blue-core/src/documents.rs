@@ -60,6 +60,10 @@ pub struct Spike {
     pub outcome: Option<SpikeOutcome>,
     pub findings: Option<String>,
     pub recommendation: Option<String>,
+    /// RFCs produced by this spike (RFC 0038)
+    /// Format: ["0038", "0039"] for local or ["blue-web:0015"] for cross-repo
+    #[serde(default)]
+    pub produces_rfcs: Vec<String>,
 }
 
 /// Outcome of a spike investigation
@@ -291,6 +295,7 @@ impl Spike {
             outcome: None,
             findings: None,
             recommendation: None,
+            produces_rfcs: Vec::new(),
         }
     }
 
@@ -311,6 +316,9 @@ impl Spike {
         }
         if let Some(ref outcome) = self.outcome {
             md.push_str(&format!("| **Outcome** | {} |\n", outcome.as_str()));
+        }
+        if !self.produces_rfcs.is_empty() {
+            md.push_str(&format!("| **Produces RFCs** | {} |\n", self.produces_rfcs.join(", ")));
         }
         md.push_str("\n---\n\n");
 
