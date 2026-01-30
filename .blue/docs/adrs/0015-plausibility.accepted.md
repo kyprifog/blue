@@ -39,3 +39,12 @@ Expected Cost = P(failure) × Cost(failure) + P(success) × Cost(prevention)
 ```
 
 If `P(failure)` is near zero, almost any `Cost(failure)` is acceptable. We waste more engineering time preventing implausible failures than we would spend recovering from them.
+
+### When Prevention Cost Approaches Zero
+
+If Claude implements, `Cost(prevention)` for code changes approaches zero. The plausibility calculus inverts:
+
+- **Previously**: "This edge case is too expensive to handle."
+- **Now**: "This edge case takes Claude 30 seconds. Handle it."
+
+But `Cost(judgment)` remains high. The new bottleneck is deciding *whether* to handle the edge case, not *affording* to handle it. See RFC 0039.

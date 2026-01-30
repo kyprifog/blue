@@ -187,23 +187,144 @@ pub struct ForgeConfig {
     pub repo: String,
 }
 
-/// Blue config file structure
+/// AWS configuration (RFC 0034)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AwsConfig {
+    /// AWS profile name from ~/.aws/config
+    pub profile: String,
+}
+
+/// Release branch configuration (RFC 0034)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseConfig {
+    /// Branch where active development happens
+    #[serde(default = "default_develop")]
+    pub develop_branch: String,
+    /// Protected release branch
+    #[serde(default = "default_main")]
+    pub main_branch: String,
+}
+
+fn default_develop() -> String {
+    "develop".to_string()
+}
+
+fn default_main() -> String {
+    "main".to_string()
+}
+
+impl Default for ReleaseConfig {
+    fn default() -> Self {
+        Self {
+            develop_branch: default_develop(),
+            main_branch: default_main(),
+        }
+    }
+}
+
+/// Worktree initialization configuration (RFC 0034)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorktreeConfig {
+    /// Additional environment variables for .env.isolated
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+}
+
+/// Configuration errors
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("Unsupported config version {found}. Supported versions: {supported:?}")]
+    UnsupportedVersion { found: u32, supported: Vec<u32> },
+
+    #[error("Invalid forge type: {0}. Must be one of: github, forgejo, gitlab, bitbucket")]
+    InvalidForgeType(String),
+
+    #[error("Missing required field: {0}")]
+    MissingField(&'static str),
+
+    #[error("Failed to read config: {0}")]
+    ReadError(String),
+
+    #[error("Failed to parse config: {0}")]
+    ParseError(String),
+}
+
+/// Blue config file structure (RFC 0034)
+///
+/// Schema version 1 - single source of truth for repo-level configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlueConfig {
+    /// Schema version for migration support (required)
+    #[serde(default = "default_version")]
+    pub version: u32,
+
+    /// Forge connection details (required)
+    pub forge: ForgeConfig,
+
+    /// AWS profile configuration (optional)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub forge: Option<ForgeConfig>,
+    pub aws: Option<AwsConfig>,
+
+    /// Release branch configuration (optional)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<ReleaseConfig>,
+
+    /// Worktree initialization configuration (optional)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeConfig>,
+}
+
+fn default_version() -> u32 {
+    1
 }
 
 impl BlueConfig {
-    /// Load config from .blue/config.yaml
-    pub fn load(blue_dir: &std::path::Path) -> Option<Self> {
-        let config_path = blue_dir.join("config.yaml");
-        if !config_path.exists() {
-            return None;
+    /// Validate the configuration schema
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        // Version check
+        if self.version != 1 {
+            return Err(ConfigError::UnsupportedVersion {
+                found: self.version,
+                supported: vec![1],
+            });
         }
 
-        let content = std::fs::read_to_string(&config_path).ok()?;
-        serde_yaml::from_str(&content).ok()
+        // Forge type validation
+        let valid_types = ["github", "forgejo", "gitlab", "bitbucket"];
+        let forge_type_str = match self.forge.forge_type {
+            ForgeType::GitHub => "github",
+            ForgeType::Forgejo => "forgejo",
+        };
+        if !valid_types.contains(&forge_type_str) {
+            return Err(ConfigError::InvalidForgeType(forge_type_str.to_string()));
+        }
+
+        Ok(())
+    }
+
+    /// Load config from .blue/config.yaml
+    pub fn load(blue_dir: &std::path::Path) -> Result<Self, ConfigError> {
+        let config_path = blue_dir.join("config.yaml");
+        if !config_path.exists() {
+            return Err(ConfigError::ReadError(format!(
+                "Config file not found: {}",
+                config_path.display()
+            )));
+        }
+
+        let content = std::fs::read_to_string(&config_path)
+            .map_err(|e| ConfigError::ReadError(e.to_string()))?;
+
+        let config: Self = serde_yaml::from_str(&content)
+            .map_err(|e| ConfigError::ParseError(e.to_string()))?;
+
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Load config, returning None if not found (backward compatible)
+    pub fn load_optional(blue_dir: &std::path::Path) -> Option<Self> {
+        Self::load(blue_dir).ok()
     }
 
     /// Save config to .blue/config.yaml
@@ -212,6 +333,27 @@ impl BlueConfig {
         let content = serde_yaml::to_string(self)
             .map_err(std::io::Error::other)?;
         std::fs::write(&config_path, content)
+    }
+
+    /// Get the AWS profile if configured
+    pub fn aws_profile(&self) -> Option<&str> {
+        self.aws.as_ref().map(|a| a.profile.as_str())
+    }
+
+    /// Get the develop branch name (with default)
+    pub fn develop_branch(&self) -> &str {
+        self.release
+            .as_ref()
+            .map(|r| r.develop_branch.as_str())
+            .unwrap_or("develop")
+    }
+
+    /// Get the main branch name (with default)
+    pub fn main_branch(&self) -> &str {
+        self.release
+            .as_ref()
+            .map(|r| r.main_branch.as_str())
+            .unwrap_or("main")
     }
 }
 
@@ -224,12 +366,10 @@ pub fn detect_forge_type_cached(remote_url: &str, blue_dir: Option<&std::path::P
 
     // Check cache first
     if let Some(dir) = blue_dir {
-        if let Some(config) = BlueConfig::load(dir) {
-            if let Some(forge) = config.forge {
-                // Validate cached config matches current remote
-                if forge.host == url.host && forge.owner == url.owner && forge.repo == url.repo {
-                    return forge.forge_type;
-                }
+        if let Ok(config) = BlueConfig::load(dir) {
+            // Validate cached config matches current remote
+            if config.forge.host == url.host && config.forge.owner == url.owner && config.forge.repo == url.repo {
+                return config.forge.forge_type;
             }
         }
     }
@@ -241,13 +381,18 @@ pub fn detect_forge_type_cached(remote_url: &str, blue_dir: Option<&std::path::P
     if let Some(dir) = blue_dir {
         let forge_config = ForgeConfig {
             forge_type,
-            host: url.host,
-            owner: url.owner,
-            repo: url.repo,
+            host: url.host.clone(),
+            owner: url.owner.clone(),
+            repo: url.repo.clone(),
         };
 
-        let mut config = BlueConfig::load(dir).unwrap_or_default();
-        config.forge = Some(forge_config);
+        let config = BlueConfig {
+            version: 1,
+            forge: forge_config,
+            aws: None,
+            release: None,
+            worktree: None,
+        };
         let _ = config.save(dir); // Ignore errors - caching is best-effort
     }
 

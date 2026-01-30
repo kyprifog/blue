@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{debug, info};
 
-use blue_core::{detect_blue, DocType, Document, ProjectState, Rfc, RfcStatus, title_to_slug, validate_rfc_transition};
+use blue_core::{detect_blue, BlueConfig, DocType, Document, ProjectState, Rfc, RfcStatus, title_to_slug, validate_rfc_transition};
 
 use crate::error::ServerError;
 
@@ -101,6 +101,7 @@ impl BlueServer {
     /// Try to load project state for the current directory
     ///
     /// RFC 0020 fallback chain: cwd → mcp_root → walk tree → fail with guidance
+    /// RFC 0034: Also injects AWS_PROFILE from config if configured
     fn ensure_state(&mut self) -> Result<&ProjectState, ServerError> {
         if self.state.is_none() {
             // RFC 0020: explicit cwd → MCP roots → walk tree → fail with guidance
@@ -114,6 +115,16 @@ impl BlueServer {
                     cwd.display()
                 ))
             })?;
+
+            // RFC 0034: Inject AWS_PROFILE from config (shell precedence honored)
+            if let Ok(config) = BlueConfig::load(&home.blue_dir) {
+                if let Some(profile) = config.aws_profile() {
+                    if std::env::var("AWS_PROFILE").is_err() {
+                        std::env::set_var("AWS_PROFILE", profile);
+                        info!(profile = %profile, "AWS profile set from .blue/config.yaml");
+                    }
+                }
+            }
 
             // Try to get project name from the current path
             let project = home.project_name.clone().unwrap_or_else(|| "default".to_string());
@@ -140,6 +151,16 @@ impl BlueServer {
                     cwd.display()
                 ))
             })?;
+
+            // RFC 0034: Inject AWS_PROFILE from config (shell precedence honored)
+            if let Ok(config) = BlueConfig::load(&home.blue_dir) {
+                if let Some(profile) = config.aws_profile() {
+                    if std::env::var("AWS_PROFILE").is_err() {
+                        std::env::set_var("AWS_PROFILE", profile);
+                        info!(profile = %profile, "AWS profile set from .blue/config.yaml");
+                    }
+                }
+            }
 
             // Try to get project name from the current path
             let project = home.project_name.clone().unwrap_or_else(|| "default".to_string());

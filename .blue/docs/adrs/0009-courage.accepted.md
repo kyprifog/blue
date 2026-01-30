@@ -37,6 +37,18 @@ Courage is acting when action is right, even when fear says wait.
 - **Ship scared.** If you're not a little afraid when you deploy, you're not shipping anything interesting.
 - **Admit ignorance quickly.** "I don't understand" is the beginning of understanding.
 
+### Greenfield is Implicit
+
+If the codebase is greenfield (no external users, no legacy constraints), courage to delete and redesign is not just permitted—it's expected.
+
+"Greenfield" is not a separate principle. It's full permission to live ADRs 0009, 0010, and 0012 without the fear tax that comes from imagined users who don't exist.
+
+- Don't accumulate band-aids. Fix the design.
+- Don't add transitions. Replace the system.
+- Don't apologize for breaking things. Celebrate making them better.
+
+See RFC 0039.
+
 ## Consequences
 
 - 💙 encourages deletion of dead code

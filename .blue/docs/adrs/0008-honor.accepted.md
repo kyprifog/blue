@@ -30,6 +30,15 @@ Honor means those promises are kept. Not because someone's checking. Because tha
 
 The gap between documentation and behavior is a measure of dishonor.
 
+### Honor's Scope is Adoption, Not Age
+
+Honor applies to **external relationships**—users who depend on stable interfaces. If Blue has zero external users, the backward compatibility constraint is vacuous.
+
+- **Internal APIs**: Redesign aggressively. Break freely. Increment major versions.
+- **External contracts**: Keep promises. Warn before breaking. Migration paths.
+
+The boundary is WHO you promised to, not HOW LONG ago. See RFC 0039.
+
 ## Consequences
 
 - 💙 keeps its promises (documented behavior matches actual behavior)
