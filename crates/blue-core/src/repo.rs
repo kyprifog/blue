@@ -346,6 +346,13 @@ pub fn create_worktree(
     branch_name: &str,
     worktree_path: &Path,
 ) -> Result<(), RepoError> {
+    // Derive worktree name from path (directory name = slug, no slashes)
+    // Git worktree names are stored in .git/worktrees/<name> and cannot contain slashes
+    let worktree_name = worktree_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| RepoError::Git(git2::Error::from_str("Invalid worktree path")))?;
+
     // Create the branch if it doesn't exist
     let head = repo.head()?;
     let head_commit = head.peel_to_commit()?;
@@ -358,7 +365,7 @@ pub fn create_worktree(
     // Create the worktree
     let reference = branch.into_reference();
     repo.worktree(
-        branch_name,
+        worktree_name,
         worktree_path,
         Some(git2::WorktreeAddOptions::new().reference(Some(&reference))),
     )?;
@@ -366,9 +373,17 @@ pub fn create_worktree(
     Ok(())
 }
 
-/// Remove a worktree
-pub fn remove_worktree(repo: &git2::Repository, name: &str) -> Result<(), RepoError> {
-    let worktree = repo.find_worktree(name)?;
+/// Remove a worktree by path
+///
+/// Derives the worktree name from the path's directory name.
+pub fn remove_worktree(repo: &git2::Repository, worktree_path: &Path) -> Result<(), RepoError> {
+    // Derive worktree name from path (same as create_worktree)
+    let worktree_name = worktree_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| RepoError::Git(git2::Error::from_str("Invalid worktree path")))?;
+
+    let worktree = repo.find_worktree(worktree_name)?;
 
     // Prune the worktree (this removes the worktree but keeps the branch)
     worktree.prune(Some(

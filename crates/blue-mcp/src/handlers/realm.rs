@@ -701,6 +701,13 @@ fn create_git_worktree(
         return Err("Worktree path already exists".to_string());
     }
 
+    // Derive worktree name from path (directory name = slug, no slashes)
+    // Git worktree names are stored in .git/worktrees/<name> and cannot contain slashes
+    let worktree_name = worktree_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("Invalid worktree path")?;
+
     // Get HEAD commit to branch from
     let head = repo.head().map_err(|e| format!("Failed to get HEAD: {}", e))?;
     let commit = head.peel_to_commit().map_err(|e| format!("Failed to get commit: {}", e))?;
@@ -720,7 +727,7 @@ fn create_git_worktree(
 
     // Create the worktree
     repo.worktree(
-        branch_name,
+        worktree_name,
         worktree_path,
         Some(git2::WorktreeAddOptions::new().reference(Some(&reference))),
     )

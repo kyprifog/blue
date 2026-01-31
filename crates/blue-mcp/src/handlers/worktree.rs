@@ -380,8 +380,9 @@ pub fn handle_cleanup(state: &ProjectState, args: &Value) -> Result<Value, Serve
     }
 
     // Remove worktree from git
-    let worktree_removed = if worktree.is_some() {
-        blue_core::repo::remove_worktree(&repo, &branch_name).is_ok()
+    let worktree_removed = if let Some(ref wt) = worktree {
+        let wt_path = Path::new(&wt.worktree_path);
+        blue_core::repo::remove_worktree(&repo, wt_path).is_ok()
     } else {
         false
     };
@@ -465,8 +466,9 @@ pub fn handle_remove(state: &ProjectState, args: &Value) -> Result<Value, Server
 
     // Remove from git
     let repo_path = state.home.root.clone();
+    let wt_path = Path::new(&worktree.worktree_path);
     if let Ok(repo) = git2::Repository::open(&repo_path) {
-        if let Err(e) = blue_core::repo::remove_worktree(&repo, &worktree.branch_name) {
+        if let Err(e) = blue_core::repo::remove_worktree(&repo, wt_path) {
             return Ok(json!({
                 "status": "error",
                 "message": blue_core::voice::error(
