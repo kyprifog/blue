@@ -31,6 +31,269 @@ pub enum AlignmentDbError {
 
     #[error("Reference not found: {0}")]
     RefNotFound(String),
+
+    #[error("Batch validation failed with {} error(s)", .0.len())]
+    BatchValidation(Vec<ValidationError>),
+}
+
+// ==================== Validation Types (RFC 0051 Phase 2c) ====================
+
+/// Error codes for validation failures
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationErrorCode {
+    /// Missing required field
+    MissingField,
+    /// Invalid entity type (not P, R, T, E, or C)
+    InvalidEntityType,
+    /// Invalid reference type (not support, oppose, etc.)
+    InvalidRefType,
+    /// Entity type doesn't match ID prefix (e.g., source_type='P' but id='T0001')
+    TypeIdMismatch,
+    /// Invalid reference target (e.g., resolve targeting a Perspective instead of Tension)
+    InvalidRefTarget,
+    /// Invalid display ID format (should be like P0101, T0203)
+    InvalidDisplayId,
+    /// Invalid tension status transition
+    InvalidStatusTransition,
+    /// Duplicate entity (already exists)
+    DuplicateEntity,
+    /// Referenced entity not found
+    EntityNotFound,
+    /// Invalid round number
+    InvalidRound,
+    /// Expert not registered in dialogue
+    ExpertNotInDialogue,
+}
+
+impl ValidationErrorCode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::MissingField => "missing_field",
+            Self::InvalidEntityType => "invalid_entity_type",
+            Self::InvalidRefType => "invalid_ref_type",
+            Self::TypeIdMismatch => "type_id_mismatch",
+            Self::InvalidRefTarget => "invalid_ref_target",
+            Self::InvalidDisplayId => "invalid_display_id",
+            Self::InvalidStatusTransition => "invalid_status_transition",
+            Self::DuplicateEntity => "duplicate_entity",
+            Self::EntityNotFound => "entity_not_found",
+            Self::InvalidRound => "invalid_round",
+            Self::ExpertNotInDialogue => "expert_not_in_dialogue",
+        }
+    }
+}
+
+/// A single validation error with context
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidationError {
+    /// Error code for programmatic handling
+    pub code: ValidationErrorCode,
+    /// Human-readable error message
+    pub message: String,
+    /// Field or path where error occurred (e.g., "perspectives[0].label")
+    pub field: Option<String>,
+    /// Suggestion for fixing the error
+    pub suggestion: Option<String>,
+    /// Additional context (e.g., valid options)
+    pub context: Option<serde_json::Value>,
+}
+
+impl ValidationError {
+    pub fn new(code: ValidationErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            field: None,
+            suggestion: None,
+            context: None,
+        }
+    }
+
+    pub fn with_field(mut self, field: impl Into<String>) -> Self {
+        self.field = Some(field.into());
+        self
+    }
+
+    pub fn with_suggestion(mut self, suggestion: impl Into<String>) -> Self {
+        self.suggestion = Some(suggestion.into());
+        self
+    }
+
+    pub fn with_context(mut self, context: serde_json::Value) -> Self {
+        self.context = Some(context);
+        self
+    }
+
+    /// Create a missing field error
+    pub fn missing_field(field: &str) -> Self {
+        Self::new(
+            ValidationErrorCode::MissingField,
+            format!("Required field '{}' is missing", field),
+        )
+        .with_field(field)
+    }
+
+    /// Create an invalid entity type error
+    pub fn invalid_entity_type(value: &str) -> Self {
+        Self::new(
+            ValidationErrorCode::InvalidEntityType,
+            format!("Invalid entity type '{}'. Must be one of: P, R, T, E, C", value),
+        )
+        .with_suggestion("Use P (Perspective), R (Recommendation), T (Tension), E (Evidence), or C (Claim)")
+        .with_context(serde_json::json!({"valid_types": ["P", "R", "T", "E", "C"]}))
+    }
+
+    /// Create an invalid ref type error
+    pub fn invalid_ref_type(value: &str) -> Self {
+        Self::new(
+            ValidationErrorCode::InvalidRefType,
+            format!("Invalid reference type '{}'. Must be one of: support, oppose, refine, address, resolve, reopen, question, depend", value),
+        )
+        .with_suggestion("Use a valid reference type")
+        .with_context(serde_json::json!({"valid_types": ["support", "oppose", "refine", "address", "resolve", "reopen", "question", "depend"]}))
+    }
+
+    /// Create a type/ID mismatch error
+    pub fn type_id_mismatch(expected_type: &str, actual_id: &str) -> Self {
+        Self::new(
+            ValidationErrorCode::TypeIdMismatch,
+            format!("Entity type '{}' doesn't match ID '{}'. ID should start with '{}'", expected_type, actual_id, expected_type),
+        )
+        .with_suggestion(format!("Use an ID starting with '{}' (e.g., {}0101)", expected_type, expected_type))
+    }
+
+    /// Create an invalid ref target error
+    pub fn invalid_ref_target(ref_type: &str, target_type: &str, expected_type: &str) -> Self {
+        Self::new(
+            ValidationErrorCode::InvalidRefTarget,
+            format!("Reference type '{}' cannot target entity type '{}'. Expected: {}", ref_type, target_type, expected_type),
+        )
+        .with_suggestion(format!("Use a {} entity as the target", expected_type))
+        .with_context(serde_json::json!({"ref_type": ref_type, "expected_target": expected_type}))
+    }
+
+    /// Create an invalid display ID error
+    pub fn invalid_display_id(id: &str) -> Self {
+        Self::new(
+            ValidationErrorCode::InvalidDisplayId,
+            format!("Invalid display ID format '{}'. Expected format: [P|R|T|E|C]RRSS (e.g., P0101, T0203)", id),
+        )
+        .with_suggestion("Use format: type prefix + 2-digit round + 2-digit sequence (e.g., P0101)")
+    }
+}
+
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}] {}", self.code.as_str(), self.message)?;
+        if let Some(field) = &self.field {
+            write!(f, " (field: {})", field)?;
+        }
+        Ok(())
+    }
+}
+
+/// Collector for batch validation errors
+#[derive(Debug, Default)]
+pub struct ValidationCollector {
+    errors: Vec<ValidationError>,
+}
+
+impl ValidationCollector {
+    pub fn new() -> Self {
+        Self { errors: Vec::new() }
+    }
+
+    pub fn add(&mut self, error: ValidationError) {
+        self.errors.push(error);
+    }
+
+    pub fn add_if<F>(&mut self, condition: bool, error_fn: F)
+    where
+        F: FnOnce() -> ValidationError,
+    {
+        if condition {
+            self.errors.push(error_fn());
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.errors.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.errors.len()
+    }
+
+    pub fn into_result<T>(self, success: T) -> Result<T, AlignmentDbError> {
+        if self.errors.is_empty() {
+            Ok(success)
+        } else {
+            Err(AlignmentDbError::BatchValidation(self.errors))
+        }
+    }
+
+    pub fn errors(&self) -> &[ValidationError] {
+        &self.errors
+    }
+
+    pub fn into_errors(self) -> Vec<ValidationError> {
+        self.errors
+    }
+}
+
+// ==================== Validation Functions ====================
+
+/// Validate a reference's semantic constraints
+pub fn validate_ref_semantics(
+    ref_type: RefType,
+    source_type: EntityType,
+    target_type: EntityType,
+) -> Option<ValidationError> {
+    // resolve, reopen, address must target Tension (T)
+    match ref_type {
+        RefType::Resolve | RefType::Reopen | RefType::Address => {
+            if target_type != EntityType::Tension {
+                return Some(ValidationError::invalid_ref_target(
+                    ref_type.as_str(),
+                    target_type.as_str(),
+                    "T (Tension)",
+                ));
+            }
+        }
+        // refine must be same-type
+        RefType::Refine => {
+            if source_type != target_type {
+                return Some(ValidationError::new(
+                    ValidationErrorCode::InvalidRefTarget,
+                    format!(
+                        "Reference type 'refine' requires same entity types. Source: {}, Target: {}",
+                        source_type.as_str(),
+                        target_type.as_str()
+                    ),
+                )
+                .with_suggestion("Use matching entity types for refine references (P→P, R→R, etc.)"));
+            }
+        }
+        // support, oppose, question, depend can target any type
+        _ => {}
+    }
+    None
+}
+
+/// Validate a display ID format and extract components
+pub fn validate_display_id(id: &str) -> Result<(EntityType, i32, i32), ValidationError> {
+    parse_display_id(id).ok_or_else(|| ValidationError::invalid_display_id(id))
+}
+
+/// Validate that a display ID matches an expected entity type
+pub fn validate_id_type_match(id: &str, expected_type: EntityType) -> Option<ValidationError> {
+    if let Some((actual_type, _, _)) = parse_display_id(id) {
+        if actual_type != expected_type {
+            return Some(ValidationError::type_id_mismatch(expected_type.as_str(), id));
+        }
+    }
+    None
 }
 
 // ==================== Enums ====================
@@ -2091,5 +2354,121 @@ mod tests {
         let experts = get_experts(&conn, &id).unwrap();
         let total_score: i32 = experts.iter().map(|e| e.total_score).sum();
         assert_eq!(total_score, 27);
+    }
+
+    // ==================== Validation Tests (RFC 0051 Phase 2c) ====================
+
+    #[test]
+    fn test_validation_error_creation() {
+        let err = ValidationError::missing_field("label");
+        assert_eq!(err.code, ValidationErrorCode::MissingField);
+        assert!(err.message.contains("label"));
+        assert_eq!(err.field, Some("label".to_string()));
+
+        let err = ValidationError::invalid_entity_type("X");
+        assert_eq!(err.code, ValidationErrorCode::InvalidEntityType);
+        assert!(err.context.is_some());
+
+        let err = ValidationError::invalid_ref_type("bogus");
+        assert_eq!(err.code, ValidationErrorCode::InvalidRefType);
+        assert!(err.suggestion.is_some());
+    }
+
+    #[test]
+    fn test_validation_collector() {
+        let mut collector = ValidationCollector::new();
+        assert!(collector.is_empty());
+
+        collector.add(ValidationError::missing_field("label"));
+        collector.add(ValidationError::missing_field("content"));
+
+        assert!(!collector.is_empty());
+        assert_eq!(collector.len(), 2);
+
+        let errors = collector.into_errors();
+        assert_eq!(errors.len(), 2);
+    }
+
+    #[test]
+    fn test_validate_ref_semantics_resolve_must_target_tension() {
+        // resolve must target Tension
+        let err = validate_ref_semantics(RefType::Resolve, EntityType::Perspective, EntityType::Perspective);
+        assert!(err.is_some());
+        assert_eq!(err.as_ref().unwrap().code, ValidationErrorCode::InvalidRefTarget);
+
+        // resolve targeting Tension is valid
+        let err = validate_ref_semantics(RefType::Resolve, EntityType::Perspective, EntityType::Tension);
+        assert!(err.is_none());
+
+        // address must target Tension
+        let err = validate_ref_semantics(RefType::Address, EntityType::Recommendation, EntityType::Claim);
+        assert!(err.is_some());
+
+        // reopen must target Tension
+        let err = validate_ref_semantics(RefType::Reopen, EntityType::Evidence, EntityType::Evidence);
+        assert!(err.is_some());
+    }
+
+    #[test]
+    fn test_validate_ref_semantics_refine_must_be_same_type() {
+        // refine P→P is valid
+        let err = validate_ref_semantics(RefType::Refine, EntityType::Perspective, EntityType::Perspective);
+        assert!(err.is_none());
+
+        // refine R→R is valid
+        let err = validate_ref_semantics(RefType::Refine, EntityType::Recommendation, EntityType::Recommendation);
+        assert!(err.is_none());
+
+        // refine P→R is invalid (different types)
+        let err = validate_ref_semantics(RefType::Refine, EntityType::Perspective, EntityType::Recommendation);
+        assert!(err.is_some());
+        assert_eq!(err.as_ref().unwrap().code, ValidationErrorCode::InvalidRefTarget);
+    }
+
+    #[test]
+    fn test_validate_ref_semantics_support_can_target_any() {
+        // support can target any entity type
+        assert!(validate_ref_semantics(RefType::Support, EntityType::Perspective, EntityType::Tension).is_none());
+        assert!(validate_ref_semantics(RefType::Support, EntityType::Evidence, EntityType::Claim).is_none());
+        assert!(validate_ref_semantics(RefType::Support, EntityType::Claim, EntityType::Recommendation).is_none());
+
+        // oppose can target any
+        assert!(validate_ref_semantics(RefType::Oppose, EntityType::Perspective, EntityType::Perspective).is_none());
+
+        // question can target any
+        assert!(validate_ref_semantics(RefType::Question, EntityType::Evidence, EntityType::Claim).is_none());
+    }
+
+    #[test]
+    fn test_validate_display_id() {
+        // Valid IDs
+        assert!(validate_display_id("P0101").is_ok());
+        assert!(validate_display_id("T0001").is_ok());
+        assert!(validate_display_id("R0203").is_ok());
+        assert!(validate_display_id("E0105").is_ok());
+        assert!(validate_display_id("C0001").is_ok());
+
+        // Invalid IDs
+        assert!(validate_display_id("X0101").is_err()); // Invalid prefix
+        assert!(validate_display_id("P01").is_err());    // Too short
+        assert!(validate_display_id("P010101").is_err()); // Too long
+        assert!(validate_display_id("").is_err());        // Empty
+        assert!(validate_display_id("PERSPECTIVE").is_err()); // Not a display ID
+    }
+
+    #[test]
+    fn test_type_id_mismatch_error() {
+        let err = ValidationError::type_id_mismatch("P", "T0101");
+        assert_eq!(err.code, ValidationErrorCode::TypeIdMismatch);
+        assert!(err.message.contains("P"));
+        assert!(err.message.contains("T0101"));
+    }
+
+    #[test]
+    fn test_invalid_ref_target_error() {
+        let err = ValidationError::invalid_ref_target("resolve", "P", "T (Tension)");
+        assert_eq!(err.code, ValidationErrorCode::InvalidRefTarget);
+        assert!(err.message.contains("resolve"));
+        assert!(err.message.contains("Tension"));
     }
 }

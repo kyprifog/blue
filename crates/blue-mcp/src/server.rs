@@ -1792,6 +1792,209 @@ impl BlueServer {
                         "required": ["output_dir", "round", "panel"]
                     }
                 },
+                // RFC 0051: Global perspective & tension tracking
+                {
+                    "name": "blue_dialogue_round_context",
+                    "description": "RFC 0051: Bulk fetch context for all panel experts in a single call. Returns structured data for prompt building.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "dialogue_id": {
+                                "type": "string",
+                                "description": "Dialogue ID (e.g., 'nvidia-investment-analysis')"
+                            },
+                            "round": {
+                                "type": "integer",
+                                "description": "Round number to get context for"
+                            }
+                        },
+                        "required": ["dialogue_id", "round"]
+                    }
+                },
+                {
+                    "name": "blue_dialogue_expert_create",
+                    "description": "RFC 0051: Create a new expert mid-dialogue to address emerging needs. The expert will be registered with source='created'.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "dialogue_id": {
+                                "type": "string",
+                                "description": "Dialogue ID"
+                            },
+                            "expert_slug": {
+                                "type": "string",
+                                "description": "Expert slug (lowercase, e.g., 'palmier')"
+                            },
+                            "role": {
+                                "type": "string",
+                                "description": "Expert role (e.g., 'Geopolitical Risk Analyst')"
+                            },
+                            "tier": {
+                                "type": "string",
+                                "enum": ["Core", "Adjacent", "Wildcard"],
+                                "description": "Expert tier"
+                            },
+                            "focus": {
+                                "type": "string",
+                                "description": "Focus area for this expert"
+                            },
+                            "creation_reason": {
+                                "type": "string",
+                                "description": "Why the Judge created this expert"
+                            },
+                            "first_round": {
+                                "type": "integer",
+                                "description": "Round when expert joins"
+                            }
+                        },
+                        "required": ["dialogue_id", "expert_slug", "role", "tier", "creation_reason", "first_round"]
+                    }
+                },
+                {
+                    "name": "blue_dialogue_round_register",
+                    "description": "RFC 0051: Bulk register all round data in a single atomic call - perspectives, recommendations, tensions, evidence, claims, scores, and refs.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "dialogue_id": {
+                                "type": "string",
+                                "description": "Dialogue ID"
+                            },
+                            "round": {
+                                "type": "integer",
+                                "description": "Round number"
+                            },
+                            "score": {
+                                "type": "integer",
+                                "description": "ALIGNMENT score for this round"
+                            },
+                            "summary": {
+                                "type": "string",
+                                "description": "Judge's synthesis of the round"
+                            },
+                            "expert_scores": {
+                                "type": "object",
+                                "description": "Map of expert_slug to score (e.g., {\"muffin\": 12, \"donut\": 15})"
+                            },
+                            "perspectives": {
+                                "type": "array",
+                                "description": "Array of perspective objects with local_id, label, content, contributors, references"
+                            },
+                            "recommendations": {
+                                "type": "array",
+                                "description": "Array of recommendation objects with local_id, label, content, contributors, parameters, references"
+                            },
+                            "tensions": {
+                                "type": "array",
+                                "description": "Array of tension objects with local_id, label, description, contributors, references"
+                            },
+                            "evidence": {
+                                "type": "array",
+                                "description": "Array of evidence objects with local_id, label, content, contributors, references"
+                            },
+                            "claims": {
+                                "type": "array",
+                                "description": "Array of claim objects with local_id, label, content, contributors, references"
+                            },
+                            "tension_updates": {
+                                "type": "array",
+                                "description": "Array of tension status updates: {id, status, by, via}"
+                            }
+                        },
+                        "required": ["dialogue_id", "round", "score"]
+                    }
+                },
+                {
+                    "name": "blue_dialogue_verdict_register",
+                    "description": "RFC 0051: Register a verdict (interim, final, minority, or dissent).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "dialogue_id": {
+                                "type": "string",
+                                "description": "Dialogue ID"
+                            },
+                            "verdict_id": {
+                                "type": "string",
+                                "description": "Verdict identifier (e.g., 'final', 'V01', 'minority-esg')"
+                            },
+                            "verdict_type": {
+                                "type": "string",
+                                "enum": ["interim", "final", "minority", "dissent"],
+                                "description": "Type of verdict"
+                            },
+                            "round": {
+                                "type": "integer",
+                                "description": "Round when verdict was issued"
+                            },
+                            "recommendation": {
+                                "type": "string",
+                                "description": "One-line decision (e.g., 'APPROVE conditional partial trim')"
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "Reasoning summary (2-3 sentences)"
+                            },
+                            "conditions": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Conditions for the verdict"
+                            },
+                            "vote": {
+                                "type": "string",
+                                "description": "Vote count (e.g., '12-0', '11-1')"
+                            },
+                            "confidence": {
+                                "type": "string",
+                                "enum": ["unanimous", "strong", "split", "contested"],
+                                "description": "Confidence level"
+                            },
+                            "tensions_resolved": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Tension IDs resolved by this verdict"
+                            },
+                            "tensions_accepted": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Tension IDs accepted (acknowledged but not blocking)"
+                            },
+                            "recommendations_adopted": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Recommendation IDs adopted"
+                            },
+                            "author_expert": {
+                                "type": "string",
+                                "description": "Expert slug if authored by expert (null = Judge)"
+                            },
+                            "supporting_experts": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Expert slugs supporting minority verdict"
+                            }
+                        },
+                        "required": ["dialogue_id", "verdict_id", "verdict_type", "round", "recommendation", "description"]
+                    }
+                },
+                {
+                    "name": "blue_dialogue_export",
+                    "description": "RFC 0051: Export dialogue to JSON with full provenance from database.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "dialogue_id": {
+                                "type": "string",
+                                "description": "Dialogue ID to export"
+                            },
+                            "output_path": {
+                                "type": "string",
+                                "description": "Path to write JSON file (optional, defaults to output_dir/dialogue.json)"
+                            }
+                        },
+                        "required": ["dialogue_id"]
+                    }
+                },
                 // Phase 8: Playwright verification
                 {
                     "name": "blue_playwright_verify",
@@ -2572,6 +2775,12 @@ impl BlueServer {
             "blue_dialogue_round_prompt" => self.handle_dialogue_round_prompt(&call.arguments),
             "blue_dialogue_sample_panel" => self.handle_dialogue_sample_panel(&call.arguments),
             "blue_dialogue_evolve_panel" => self.handle_dialogue_evolve_panel(&call.arguments),
+            // RFC 0051: Global perspective & tension tracking
+            "blue_dialogue_round_context" => self.handle_dialogue_round_context(&call.arguments),
+            "blue_dialogue_expert_create" => self.handle_dialogue_expert_create(&call.arguments),
+            "blue_dialogue_round_register" => self.handle_dialogue_round_register(&call.arguments),
+            "blue_dialogue_verdict_register" => self.handle_dialogue_verdict_register(&call.arguments),
+            "blue_dialogue_export" => self.handle_dialogue_export(&call.arguments),
             // Phase 8: Playwright handler
             "blue_playwright_verify" => self.handle_playwright_verify(&call.arguments),
             // Phase 9: Post-mortem handlers
@@ -3912,6 +4121,38 @@ impl BlueServer {
     fn handle_dialogue_evolve_panel(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
         let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
         crate::handlers::dialogue::handle_evolve_panel(args)
+    }
+
+    // RFC 0051: Global perspective & tension tracking handlers
+
+    fn handle_dialogue_round_context(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        let state = self.ensure_state()?;
+        crate::handlers::dialogue::handle_round_context(state, args)
+    }
+
+    fn handle_dialogue_expert_create(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        let state = self.ensure_state()?;
+        crate::handlers::dialogue::handle_expert_create(state, args)
+    }
+
+    fn handle_dialogue_round_register(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        let state = self.ensure_state()?;
+        crate::handlers::dialogue::handle_round_register(state, args)
+    }
+
+    fn handle_dialogue_verdict_register(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        let state = self.ensure_state()?;
+        crate::handlers::dialogue::handle_verdict_register(state, args)
+    }
+
+    fn handle_dialogue_export(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        let state = self.ensure_state()?;
+        crate::handlers::dialogue::handle_export(state, args)
     }
 
     fn handle_playwright_verify(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {

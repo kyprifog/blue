@@ -9,6 +9,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use blue_core::{DocType, Document, LinkType, ProjectState, title_to_slug};
+use blue_core::alignment_db::{
+    self, ExpertTier as DbExpertTier, ExpertSource as DbExpertSource,
+    EntityType, RefType, VerdictType, Verdict,
+    ValidationError, ValidationCollector,
+    validate_ref_semantics, validate_display_id,
+    get_dialogue, register_expert, get_experts,
+    create_round, register_perspective, register_tension,
+    register_recommendation, register_evidence, register_claim, register_ref,
+    register_verdict, update_tension_status, update_expert_score,
+    get_perspectives, get_tensions, get_recommendations, get_evidence, get_claims, get_verdicts,
+    display_id, parse_display_id,
+};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1981,6 +1993,938 @@ pub fn handle_evolve_panel(args: &Value) -> Result<Value, ServerError> {
             "relevance": a.relevance,
             "focus": a.focus,
         })).collect::<Vec<_>>(),
+    }))
+}
+
+// ==================== RFC 0051: Global Perspective & Tension Tracking ====================
+
+/// Handle blue_dialogue_round_context (RFC 0051)
+///
+/// Bulk fetch context for all panel experts in a single call.
+/// Returns structured data for prompt building: open perspectives, tensions, etc.
+pub fn handle_round_context(state: &ProjectState, args: &Value) -> Result<Value, ServerError> {
+    let dialogue_id = args
+        .get("dialogue_id")
+        .and_then(|v| v.as_str())
+        .ok_or(ServerError::InvalidParams)?;
+
+    let round = args
+        .get("round")
+        .and_then(|v| v.as_i64())
+        .ok_or(ServerError::InvalidParams)? as i32;
+
+    let conn = state.store.conn();
+
+    // Get dialogue
+    let dialogue = get_dialogue(conn, dialogue_id)
+        .map_err(|e| ServerError::CommandFailed(format!("Dialogue not found: {}", e)))?;
+
+    // Get experts
+    let experts = get_experts(conn, dialogue_id)
+        .map_err(|e| ServerError::CommandFailed(format!("Failed to get experts: {}", e)))?;
+
+    // Get all perspectives
+    let perspectives = get_perspectives(conn, dialogue_id)
+        .map_err(|e| ServerError::CommandFailed(format!("Failed to get perspectives: {}", e)))?;
+
+    // Get all tensions (filter for open/addressed in response)
+    let tensions = get_tensions(conn, dialogue_id)
+        .map_err(|e| ServerError::CommandFailed(format!("Failed to get tensions: {}", e)))?;
+
+    // Get recommendations
+    let recommendations = get_recommendations(conn, dialogue_id)
+        .map_err(|e| ServerError::CommandFailed(format!("Failed to get recommendations: {}", e)))?;
+
+    // Get evidence
+    let evidence = get_evidence(conn, dialogue_id)
+        .map_err(|e| ServerError::CommandFailed(format!("Failed to get evidence: {}", e)))?;
+
+    // Get claims
+    let claims = get_claims(conn, dialogue_id)
+        .map_err(|e| ServerError::CommandFailed(format!("Failed to get claims: {}", e)))?;
+
+    // Get verdicts
+    let verdicts = get_verdicts(conn, dialogue_id)
+        .map_err(|e| ServerError::CommandFailed(format!("Failed to get verdicts: {}", e)))?;
+
+    // Build context response
+    Ok(json!({
+        "status": "success",
+        "dialogue_id": dialogue_id,
+        "round": round,
+        "dialogue": {
+            "title": dialogue.title,
+            "question": dialogue.question,
+            "status": dialogue.status.as_str(),
+            "total_rounds": dialogue.total_rounds,
+            "total_alignment": dialogue.total_alignment,
+        },
+        "experts": experts.iter().map(|e| json!({
+            "expert_slug": e.expert_slug,
+            "role": e.role,
+            "tier": e.tier.as_str(),
+            "source": e.source.as_str(),
+            "focus": e.focus,
+            "total_score": e.total_score,
+        })).collect::<Vec<_>>(),
+        "perspectives": perspectives.iter().map(|p| json!({
+            "id": display_id(EntityType::Perspective, p.round, p.seq),
+            "round": p.round,
+            "label": p.label,
+            "content": p.content,
+            "contributors": p.contributors,
+            "status": p.status.as_str(),
+        })).collect::<Vec<_>>(),
+        "tensions": tensions.iter().map(|t| json!({
+            "id": display_id(EntityType::Tension, t.round, t.seq),
+            "round": t.round,
+            "label": t.label,
+            "description": t.description,
+            "contributors": t.contributors,
+            "status": t.status.as_str(),
+        })).collect::<Vec<_>>(),
+        "open_tensions": tensions.iter()
+            .filter(|t| matches!(t.status, alignment_db::TensionStatus::Open | alignment_db::TensionStatus::Reopened))
+            .map(|t| display_id(EntityType::Tension, t.round, t.seq))
+            .collect::<Vec<_>>(),
+        "recommendations": recommendations.iter().map(|r| json!({
+            "id": display_id(EntityType::Recommendation, r.round, r.seq),
+            "round": r.round,
+            "label": r.label,
+            "content": r.content,
+            "contributors": r.contributors,
+            "status": r.status.as_str(),
+            "parameters": r.parameters,
+        })).collect::<Vec<_>>(),
+        "evidence": evidence.iter().map(|e| json!({
+            "id": display_id(EntityType::Evidence, e.round, e.seq),
+            "round": e.round,
+            "label": e.label,
+            "content": e.content,
+            "contributors": e.contributors,
+            "status": e.status.as_str(),
+        })).collect::<Vec<_>>(),
+        "claims": claims.iter().map(|c| json!({
+            "id": display_id(EntityType::Claim, c.round, c.seq),
+            "round": c.round,
+            "label": c.label,
+            "content": c.content,
+            "contributors": c.contributors,
+            "status": c.status.as_str(),
+        })).collect::<Vec<_>>(),
+        "verdicts": verdicts.iter().map(|v| json!({
+            "verdict_id": v.verdict_id,
+            "verdict_type": v.verdict_type.as_str(),
+            "round": v.round,
+            "recommendation": v.recommendation,
+            "description": v.description,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+/// Handle blue_dialogue_expert_create (RFC 0051)
+///
+/// Create a new expert mid-dialogue to address emerging needs.
+pub fn handle_expert_create(state: &ProjectState, args: &Value) -> Result<Value, ServerError> {
+    let dialogue_id = args
+        .get("dialogue_id")
+        .and_then(|v| v.as_str())
+        .ok_or(ServerError::InvalidParams)?;
+
+    let expert_slug = args
+        .get("expert_slug")
+        .and_then(|v| v.as_str())
+        .ok_or(ServerError::InvalidParams)?;
+
+    let role = args
+        .get("role")
+        .and_then(|v| v.as_str())
+        .ok_or(ServerError::InvalidParams)?;
+
+    let tier_str = args
+        .get("tier")
+        .and_then(|v| v.as_str())
+        .ok_or(ServerError::InvalidParams)?;
+
+    let tier = DbExpertTier::from_str(tier_str);
+
+    let focus = args.get("focus").and_then(|v| v.as_str());
+
+    let creation_reason = args
+        .get("creation_reason")
+        .and_then(|v| v.as_str())
+        .ok_or(ServerError::InvalidParams)?;
+
+    let first_round = args
+        .get("first_round")
+        .and_then(|v| v.as_i64())
+        .ok_or(ServerError::InvalidParams)? as i32;
+
+    let conn = state.store.conn();
+
+    // Verify dialogue exists
+    let _dialogue = get_dialogue(conn, dialogue_id)
+        .map_err(|e| ServerError::CommandFailed(format!("Dialogue not found: {}", e)))?;
+
+    // Register expert with source=created
+    register_expert(
+        conn,
+        dialogue_id,
+        expert_slug,
+        role,
+        tier,
+        DbExpertSource::Created,
+        None, // description
+        focus,
+        None, // relevance
+        Some(creation_reason),
+        None, // color
+        Some(first_round),
+    )
+    .map_err(|e| ServerError::CommandFailed(format!("Failed to create expert: {}", e)))?;
+
+    Ok(json!({
+        "status": "success",
+        "message": format!("Created expert '{}' ({}) for round {}", expert_slug, role, first_round),
+        "expert": {
+            "expert_slug": expert_slug,
+            "role": role,
+            "tier": tier.as_str(),
+            "source": "created",
+            "focus": focus,
+            "creation_reason": creation_reason,
+            "first_round": first_round,
+        }
+    }))
+}
+
+/// Validate round_register inputs (RFC 0051 Phase 2c)
+///
+/// Returns all validation errors, not just the first one.
+fn validate_round_register_inputs(args: &Value) -> Vec<ValidationError> {
+    let mut collector = ValidationCollector::new();
+
+    // Validate perspectives
+    if let Some(perspectives) = args.get("perspectives").and_then(|v| v.as_array()) {
+        for (i, p) in perspectives.iter().enumerate() {
+            let field_prefix = format!("perspectives[{}]", i);
+
+            // Required fields
+            if p.get("label").and_then(|v| v.as_str()).map(|s| s.is_empty()).unwrap_or(true) {
+                collector.add(ValidationError::missing_field("label").with_field(format!("{}.label", field_prefix)));
+            }
+            if p.get("content").and_then(|v| v.as_str()).map(|s| s.is_empty()).unwrap_or(true) {
+                collector.add(ValidationError::missing_field("content").with_field(format!("{}.content", field_prefix)));
+            }
+
+            // Validate references
+            if let Some(refs) = p.get("references").and_then(|v| v.as_array()) {
+                for (j, r) in refs.iter().enumerate() {
+                    let ref_field = format!("{}.references[{}]", field_prefix, j);
+
+                    let ref_type_str = r.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    let target = r.get("target").and_then(|v| v.as_str()).unwrap_or("");
+
+                    // Validate ref type
+                    if RefType::from_str(ref_type_str).is_none() && !ref_type_str.is_empty() {
+                        collector.add(ValidationError::invalid_ref_type(ref_type_str).with_field(format!("{}.type", ref_field)));
+                    }
+
+                    // Validate target ID format
+                    if !target.is_empty() {
+                        if let Err(e) = validate_display_id(target) {
+                            collector.add(e.with_field(format!("{}.target", ref_field)));
+                        } else if let (Some(ref_type), Some((target_type, _, _))) = (RefType::from_str(ref_type_str), parse_display_id(target)) {
+                            // Validate semantic constraints
+                            if let Some(e) = validate_ref_semantics(ref_type, EntityType::Perspective, target_type) {
+                                collector.add(e.with_field(ref_field));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Validate tensions
+    if let Some(tensions) = args.get("tensions").and_then(|v| v.as_array()) {
+        for (i, t) in tensions.iter().enumerate() {
+            let field_prefix = format!("tensions[{}]", i);
+
+            if t.get("label").and_then(|v| v.as_str()).map(|s| s.is_empty()).unwrap_or(true) {
+                collector.add(ValidationError::missing_field("label").with_field(format!("{}.label", field_prefix)));
+            }
+            if t.get("description").and_then(|v| v.as_str()).map(|s| s.is_empty()).unwrap_or(true) {
+                collector.add(ValidationError::missing_field("description").with_field(format!("{}.description", field_prefix)));
+            }
+
+            // Validate references
+            if let Some(refs) = t.get("references").and_then(|v| v.as_array()) {
+                for (j, r) in refs.iter().enumerate() {
+                    let ref_field = format!("{}.references[{}]", field_prefix, j);
+                    let ref_type_str = r.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    let target = r.get("target").and_then(|v| v.as_str()).unwrap_or("");
+
+                    if RefType::from_str(ref_type_str).is_none() && !ref_type_str.is_empty() {
+                        collector.add(ValidationError::invalid_ref_type(ref_type_str).with_field(format!("{}.type", ref_field)));
+                    }
+
+                    if !target.is_empty() {
+                        if let Err(e) = validate_display_id(target) {
+                            collector.add(e.with_field(format!("{}.target", ref_field)));
+                        } else if let (Some(ref_type), Some((target_type, _, _))) = (RefType::from_str(ref_type_str), parse_display_id(target)) {
+                            if let Some(e) = validate_ref_semantics(ref_type, EntityType::Tension, target_type) {
+                                collector.add(e.with_field(ref_field));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Validate recommendations
+    if let Some(recommendations) = args.get("recommendations").and_then(|v| v.as_array()) {
+        for (i, r) in recommendations.iter().enumerate() {
+            let field_prefix = format!("recommendations[{}]", i);
+
+            if r.get("label").and_then(|v| v.as_str()).map(|s| s.is_empty()).unwrap_or(true) {
+                collector.add(ValidationError::missing_field("label").with_field(format!("{}.label", field_prefix)));
+            }
+            if r.get("content").and_then(|v| v.as_str()).map(|s| s.is_empty()).unwrap_or(true) {
+                collector.add(ValidationError::missing_field("content").with_field(format!("{}.content", field_prefix)));
+            }
+
+            // Validate references
+            if let Some(refs) = r.get("references").and_then(|v| v.as_array()) {
+                for (j, ref_obj) in refs.iter().enumerate() {
+                    let ref_field = format!("{}.references[{}]", field_prefix, j);
+                    let ref_type_str = ref_obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    let target = ref_obj.get("target").and_then(|v| v.as_str()).unwrap_or("");
+
+                    if RefType::from_str(ref_type_str).is_none() && !ref_type_str.is_empty() {
+                        collector.add(ValidationError::invalid_ref_type(ref_type_str).with_field(format!("{}.type", ref_field)));
+                    }
+
+                    if !target.is_empty() {
+                        if let Err(e) = validate_display_id(target) {
+                            collector.add(e.with_field(format!("{}.target", ref_field)));
+                        } else if let (Some(ref_type), Some((target_type, _, _))) = (RefType::from_str(ref_type_str), parse_display_id(target)) {
+                            if let Some(e) = validate_ref_semantics(ref_type, EntityType::Recommendation, target_type) {
+                                collector.add(e.with_field(ref_field));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Validate evidence
+    if let Some(evidence) = args.get("evidence").and_then(|v| v.as_array()) {
+        for (i, e) in evidence.iter().enumerate() {
+            let field_prefix = format!("evidence[{}]", i);
+
+            if e.get("label").and_then(|v| v.as_str()).map(|s| s.is_empty()).unwrap_or(true) {
+                collector.add(ValidationError::missing_field("label").with_field(format!("{}.label", field_prefix)));
+            }
+            if e.get("content").and_then(|v| v.as_str()).map(|s| s.is_empty()).unwrap_or(true) {
+                collector.add(ValidationError::missing_field("content").with_field(format!("{}.content", field_prefix)));
+            }
+        }
+    }
+
+    // Validate claims
+    if let Some(claims) = args.get("claims").and_then(|v| v.as_array()) {
+        for (i, c) in claims.iter().enumerate() {
+            let field_prefix = format!("claims[{}]", i);
+
+            if c.get("label").and_then(|v| v.as_str()).map(|s| s.is_empty()).unwrap_or(true) {
+                collector.add(ValidationError::missing_field("label").with_field(format!("{}.label", field_prefix)));
+            }
+            if c.get("content").and_then(|v| v.as_str()).map(|s| s.is_empty()).unwrap_or(true) {
+                collector.add(ValidationError::missing_field("content").with_field(format!("{}.content", field_prefix)));
+            }
+        }
+    }
+
+    // Validate tension updates
+    if let Some(updates) = args.get("tension_updates").and_then(|v| v.as_array()) {
+        for (i, u) in updates.iter().enumerate() {
+            let field_prefix = format!("tension_updates[{}]", i);
+            let tension_id = u.get("id").and_then(|v| v.as_str()).unwrap_or("");
+
+            if tension_id.is_empty() {
+                collector.add(ValidationError::missing_field("id").with_field(format!("{}.id", field_prefix)));
+            } else if let Err(e) = validate_display_id(tension_id) {
+                collector.add(e.with_field(format!("{}.id", field_prefix)));
+            } else if let Some((entity_type, _, _)) = parse_display_id(tension_id) {
+                if entity_type != EntityType::Tension {
+                    collector.add(ValidationError::type_id_mismatch("T", tension_id).with_field(format!("{}.id", field_prefix)));
+                }
+            }
+        }
+    }
+
+    collector.into_errors()
+}
+
+/// Convert validation errors to a structured JSON response
+fn validation_errors_to_json(errors: &[ValidationError]) -> Value {
+    json!({
+        "status": "error",
+        "error_code": "validation_failed",
+        "error_count": errors.len(),
+        "message": format!("Validation failed with {} error(s)", errors.len()),
+        "errors": errors.iter().map(|e| json!({
+            "code": e.code.as_str(),
+            "message": e.message,
+            "field": e.field,
+            "suggestion": e.suggestion,
+            "context": e.context,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Handle blue_dialogue_round_register (RFC 0051)
+///
+/// Bulk register all round data in a single atomic call.
+pub fn handle_round_register(state: &ProjectState, args: &Value) -> Result<Value, ServerError> {
+    let dialogue_id = args
+        .get("dialogue_id")
+        .and_then(|v| v.as_str())
+        .ok_or(ServerError::InvalidParams)?;
+
+    let round = args
+        .get("round")
+        .and_then(|v| v.as_i64())
+        .ok_or(ServerError::InvalidParams)? as i32;
+
+    let score = args
+        .get("score")
+        .and_then(|v| v.as_i64())
+        .ok_or(ServerError::InvalidParams)? as i32;
+
+    let summary = args.get("summary").and_then(|v| v.as_str());
+
+    // Phase 2c: Batch validation - collect ALL errors before registration
+    let validation_errors = validate_round_register_inputs(args);
+    if !validation_errors.is_empty() {
+        return Ok(validation_errors_to_json(&validation_errors));
+    }
+
+    let conn = state.store.conn();
+
+    // Verify dialogue exists
+    let _dialogue = get_dialogue(conn, dialogue_id)
+        .map_err(|e| ServerError::CommandFailed(format!("Dialogue not found: {}", e)))?;
+
+    // Create round record (title, then score)
+    create_round(conn, dialogue_id, round, summary, score)
+        .map_err(|e| ServerError::CommandFailed(format!("Failed to create round: {}", e)))?;
+
+    let mut registered = json!({
+        "perspectives": [],
+        "tensions": [],
+        "recommendations": [],
+        "evidence": [],
+        "claims": [],
+        "refs": 0,
+        "expert_scores": [],
+    });
+
+    // Register perspectives
+    if let Some(perspectives) = args.get("perspectives").and_then(|v| v.as_array()) {
+        let mut p_ids = Vec::new();
+        for p in perspectives {
+            let local_id = p.get("local_id").and_then(|v| v.as_str()).unwrap_or("");
+            let label = p.get("label").and_then(|v| v.as_str()).unwrap_or("");
+            let content = p.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let contributors: Vec<String> = p
+                .get("contributors")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+
+            let global_id = register_perspective(conn, dialogue_id, round, label, content, &contributors, None)
+                .map_err(|e| ServerError::CommandFailed(format!("Failed to register perspective: {}", e)))?;
+
+            // Register refs for this perspective
+            if let Some(refs) = p.get("references").and_then(|v| v.as_array()) {
+                for r in refs {
+                    let ref_type_str = r.get("type").and_then(|v| v.as_str()).unwrap_or("support");
+                    let target = r.get("target").and_then(|v| v.as_str()).unwrap_or("");
+                    if let (Some(ref_type), Some((target_type, _, _))) = (RefType::from_str(ref_type_str), parse_display_id(target)) {
+                        let _ = register_ref(conn, dialogue_id, EntityType::Perspective, &global_id, ref_type, target_type, target);
+                    }
+                }
+            }
+
+            p_ids.push(json!({ "local_id": local_id, "global_id": global_id }));
+        }
+        registered["perspectives"] = json!(p_ids);
+    }
+
+    // Register tensions
+    if let Some(tensions) = args.get("tensions").and_then(|v| v.as_array()) {
+        let mut t_ids = Vec::new();
+        for t in tensions {
+            let local_id = t.get("local_id").and_then(|v| v.as_str()).unwrap_or("");
+            let label = t.get("label").and_then(|v| v.as_str()).unwrap_or("");
+            let description = t.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            let contributors: Vec<String> = t
+                .get("contributors")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+
+            let global_id = register_tension(conn, dialogue_id, round, label, description, &contributors, None)
+                .map_err(|e| ServerError::CommandFailed(format!("Failed to register tension: {}", e)))?;
+
+            // Register refs for this tension
+            if let Some(refs) = t.get("references").and_then(|v| v.as_array()) {
+                for r in refs {
+                    let ref_type_str = r.get("type").and_then(|v| v.as_str()).unwrap_or("support");
+                    let target = r.get("target").and_then(|v| v.as_str()).unwrap_or("");
+                    if let (Some(ref_type), Some((target_type, _, _))) = (RefType::from_str(ref_type_str), parse_display_id(target)) {
+                        let _ = register_ref(conn, dialogue_id, EntityType::Tension, &global_id, ref_type, target_type, target);
+                    }
+                }
+            }
+
+            t_ids.push(json!({ "local_id": local_id, "global_id": global_id }));
+        }
+        registered["tensions"] = json!(t_ids);
+    }
+
+    // Register recommendations
+    if let Some(recommendations) = args.get("recommendations").and_then(|v| v.as_array()) {
+        let mut r_ids = Vec::new();
+        for r in recommendations {
+            let local_id = r.get("local_id").and_then(|v| v.as_str()).unwrap_or("");
+            let label = r.get("label").and_then(|v| v.as_str()).unwrap_or("");
+            let content = r.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let contributors: Vec<String> = r
+                .get("contributors")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let parameters = r.get("parameters").cloned();
+
+            let global_id = register_recommendation(conn, dialogue_id, round, label, content, &contributors, parameters.as_ref(), None)
+                .map_err(|e| ServerError::CommandFailed(format!("Failed to register recommendation: {}", e)))?;
+
+            // Register refs
+            if let Some(refs) = r.get("references").and_then(|v| v.as_array()) {
+                for ref_obj in refs {
+                    let ref_type_str = ref_obj.get("type").and_then(|v| v.as_str()).unwrap_or("support");
+                    let target = ref_obj.get("target").and_then(|v| v.as_str()).unwrap_or("");
+                    if let (Some(ref_type), Some((target_type, _, _))) = (RefType::from_str(ref_type_str), parse_display_id(target)) {
+                        let _ = register_ref(conn, dialogue_id, EntityType::Recommendation, &global_id, ref_type, target_type, target);
+                    }
+                }
+            }
+
+            r_ids.push(json!({ "local_id": local_id, "global_id": global_id }));
+        }
+        registered["recommendations"] = json!(r_ids);
+    }
+
+    // Register evidence
+    if let Some(evidence_arr) = args.get("evidence").and_then(|v| v.as_array()) {
+        let mut e_ids = Vec::new();
+        for e in evidence_arr {
+            let local_id = e.get("local_id").and_then(|v| v.as_str()).unwrap_or("");
+            let label = e.get("label").and_then(|v| v.as_str()).unwrap_or("");
+            let content = e.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let contributors: Vec<String> = e
+                .get("contributors")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+
+            let global_id = register_evidence(conn, dialogue_id, round, label, content, &contributors, None)
+                .map_err(|e| ServerError::CommandFailed(format!("Failed to register evidence: {}", e)))?;
+
+            // Register refs
+            if let Some(refs) = e.get("references").and_then(|v| v.as_array()) {
+                for ref_obj in refs {
+                    let ref_type_str = ref_obj.get("type").and_then(|v| v.as_str()).unwrap_or("support");
+                    let target = ref_obj.get("target").and_then(|v| v.as_str()).unwrap_or("");
+                    if let (Some(ref_type), Some((target_type, _, _))) = (RefType::from_str(ref_type_str), parse_display_id(target)) {
+                        let _ = register_ref(conn, dialogue_id, EntityType::Evidence, &global_id, ref_type, target_type, target);
+                    }
+                }
+            }
+
+            e_ids.push(json!({ "local_id": local_id, "global_id": global_id }));
+        }
+        registered["evidence"] = json!(e_ids);
+    }
+
+    // Register claims
+    if let Some(claims_arr) = args.get("claims").and_then(|v| v.as_array()) {
+        let mut c_ids = Vec::new();
+        for c in claims_arr {
+            let local_id = c.get("local_id").and_then(|v| v.as_str()).unwrap_or("");
+            let label = c.get("label").and_then(|v| v.as_str()).unwrap_or("");
+            let content = c.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let contributors: Vec<String> = c
+                .get("contributors")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+
+            let global_id = register_claim(conn, dialogue_id, round, label, content, &contributors, None)
+                .map_err(|e| ServerError::CommandFailed(format!("Failed to register claim: {}", e)))?;
+
+            // Register refs
+            if let Some(refs) = c.get("references").and_then(|v| v.as_array()) {
+                for ref_obj in refs {
+                    let ref_type_str = ref_obj.get("type").and_then(|v| v.as_str()).unwrap_or("support");
+                    let target = ref_obj.get("target").and_then(|v| v.as_str()).unwrap_or("");
+                    if let (Some(ref_type), Some((target_type, _, _))) = (RefType::from_str(ref_type_str), parse_display_id(target)) {
+                        let _ = register_ref(conn, dialogue_id, EntityType::Claim, &global_id, ref_type, target_type, target);
+                    }
+                }
+            }
+
+            c_ids.push(json!({ "local_id": local_id, "global_id": global_id }));
+        }
+        registered["claims"] = json!(c_ids);
+    }
+
+    // Process tension updates
+    if let Some(updates) = args.get("tension_updates").and_then(|v| v.as_array()) {
+        for u in updates {
+            let tension_id = u.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let status_str = u.get("status").and_then(|v| v.as_str()).unwrap_or("open");
+            let actors: Vec<String> = u
+                .get("by")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .or_else(|| u.get("by").and_then(|v| v.as_str()).map(|s| vec![s.to_string()]))
+                .unwrap_or_default();
+            let via = u.get("via").and_then(|v| v.as_str());
+
+            let status = alignment_db::TensionStatus::from_str(status_str);
+            let _ = update_tension_status(conn, dialogue_id, tension_id, status, &actors, via, round);
+        }
+    }
+
+    // Update expert scores
+    if let Some(expert_scores) = args.get("expert_scores").and_then(|v| v.as_object()) {
+        let mut updated_scores = Vec::new();
+        for (expert_slug, score_val) in expert_scores {
+            if let Some(expert_score) = score_val.as_i64() {
+                let _ = update_expert_score(conn, dialogue_id, expert_slug, round, expert_score as i32);
+                updated_scores.push(json!({ "expert_slug": expert_slug, "score": expert_score }));
+            }
+        }
+        registered["expert_scores"] = json!(updated_scores);
+    }
+
+    Ok(json!({
+        "status": "success",
+        "message": format!("Registered round {} data for dialogue '{}'", round, dialogue_id),
+        "dialogue_id": dialogue_id,
+        "round": round,
+        "score": score,
+        "registered": registered,
+    }))
+}
+
+/// Handle blue_dialogue_verdict_register (RFC 0051)
+///
+/// Register a verdict (interim, final, minority, or dissent).
+pub fn handle_verdict_register(state: &ProjectState, args: &Value) -> Result<Value, ServerError> {
+    let dialogue_id = args
+        .get("dialogue_id")
+        .and_then(|v| v.as_str())
+        .ok_or(ServerError::InvalidParams)?;
+
+    let verdict_id = args
+        .get("verdict_id")
+        .and_then(|v| v.as_str())
+        .ok_or(ServerError::InvalidParams)?;
+
+    let verdict_type_str = args
+        .get("verdict_type")
+        .and_then(|v| v.as_str())
+        .ok_or(ServerError::InvalidParams)?;
+
+    let verdict_type = VerdictType::from_str(verdict_type_str);
+
+    let round = args
+        .get("round")
+        .and_then(|v| v.as_i64())
+        .ok_or(ServerError::InvalidParams)? as i32;
+
+    let recommendation = args
+        .get("recommendation")
+        .and_then(|v| v.as_str())
+        .ok_or(ServerError::InvalidParams)?;
+
+    let description = args
+        .get("description")
+        .and_then(|v| v.as_str())
+        .ok_or(ServerError::InvalidParams)?;
+
+    // Optional fields
+    let conditions: Option<Vec<String>> = args
+        .get("conditions")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+
+    let vote = args.get("vote").and_then(|v| v.as_str()).map(String::from);
+    let confidence = args.get("confidence").and_then(|v| v.as_str()).map(String::from);
+    let author_expert = args.get("author_expert").and_then(|v| v.as_str()).map(String::from);
+
+    let tensions_resolved: Option<Vec<String>> = args
+        .get("tensions_resolved")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+
+    let tensions_accepted: Option<Vec<String>> = args
+        .get("tensions_accepted")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+
+    let recommendations_adopted: Option<Vec<String>> = args
+        .get("recommendations_adopted")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+
+    let supporting_experts: Option<Vec<String>> = args
+        .get("supporting_experts")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+
+    let conn = state.store.conn();
+
+    // Verify dialogue exists
+    let _dialogue = get_dialogue(conn, dialogue_id)
+        .map_err(|e| ServerError::CommandFailed(format!("Dialogue not found: {}", e)))?;
+
+    let verdict = Verdict {
+        dialogue_id: dialogue_id.to_string(),
+        verdict_id: verdict_id.to_string(),
+        verdict_type,
+        round,
+        author_expert,
+        recommendation: recommendation.to_string(),
+        description: description.to_string(),
+        conditions,
+        vote,
+        confidence,
+        tensions_resolved,
+        tensions_accepted,
+        recommendations_adopted,
+        key_evidence: None,
+        key_claims: None,
+        supporting_experts,
+        ethos_compliance: None,
+        created_at: chrono::Utc::now(),
+    };
+
+    register_verdict(conn, &verdict)
+        .map_err(|e| ServerError::CommandFailed(format!("Failed to register verdict: {}", e)))?;
+
+    Ok(json!({
+        "status": "success",
+        "message": format!("Registered {} verdict '{}' for dialogue '{}'", verdict_type.as_str(), verdict_id, dialogue_id),
+        "dialogue_id": dialogue_id,
+        "verdict_id": verdict_id,
+        "verdict_type": verdict_type.as_str(),
+        "round": round,
+    }))
+}
+
+/// Handle blue_dialogue_export (RFC 0051)
+///
+/// Export dialogue to JSON with full provenance from database.
+pub fn handle_export(state: &ProjectState, args: &Value) -> Result<Value, ServerError> {
+    let dialogue_id = args
+        .get("dialogue_id")
+        .and_then(|v| v.as_str())
+        .ok_or(ServerError::InvalidParams)?;
+
+    let output_path = args.get("output_path").and_then(|v| v.as_str());
+
+    let conn = state.store.conn();
+
+    // Get dialogue
+    let dialogue = get_dialogue(conn, dialogue_id)
+        .map_err(|e| ServerError::CommandFailed(format!("Dialogue not found: {}", e)))?;
+
+    // Get all data
+    let experts = get_experts(conn, dialogue_id)
+        .map_err(|e| ServerError::CommandFailed(format!("Failed to get experts: {}", e)))?;
+
+    let perspectives = get_perspectives(conn, dialogue_id)
+        .map_err(|e| ServerError::CommandFailed(format!("Failed to get perspectives: {}", e)))?;
+
+    let tensions = get_tensions(conn, dialogue_id)
+        .map_err(|e| ServerError::CommandFailed(format!("Failed to get tensions: {}", e)))?;
+
+    let recommendations = get_recommendations(conn, dialogue_id)
+        .map_err(|e| ServerError::CommandFailed(format!("Failed to get recommendations: {}", e)))?;
+
+    let evidence = get_evidence(conn, dialogue_id)
+        .map_err(|e| ServerError::CommandFailed(format!("Failed to get evidence: {}", e)))?;
+
+    let claims = get_claims(conn, dialogue_id)
+        .map_err(|e| ServerError::CommandFailed(format!("Failed to get claims: {}", e)))?;
+
+    let verdicts = get_verdicts(conn, dialogue_id)
+        .map_err(|e| ServerError::CommandFailed(format!("Failed to get verdicts: {}", e)))?;
+
+    // Build export structure
+    let export_data = json!({
+        "dialogue": {
+            "dialogue_id": dialogue.dialogue_id,
+            "title": dialogue.title,
+            "question": dialogue.question,
+            "status": dialogue.status.as_str(),
+            "created_at": dialogue.created_at.to_rfc3339(),
+            "converged_at": dialogue.converged_at.map(|dt| dt.to_rfc3339()),
+            "total_rounds": dialogue.total_rounds,
+            "total_alignment": dialogue.total_alignment,
+            "output_dir": dialogue.output_dir,
+            "calibrated": dialogue.calibrated,
+            "background": dialogue.background,
+        },
+        "experts": experts.iter().map(|e| json!({
+            "expert_slug": e.expert_slug,
+            "role": e.role,
+            "description": e.description,
+            "focus": e.focus,
+            "tier": e.tier.as_str(),
+            "source": e.source.as_str(),
+            "relevance": e.relevance,
+            "creation_reason": e.creation_reason,
+            "scores": e.scores,
+            "total_score": e.total_score,
+            "first_round": e.first_round,
+            "created_at": e.created_at.to_rfc3339(),
+        })).collect::<Vec<_>>(),
+        "perspectives": perspectives.iter().map(|p| json!({
+            "id": display_id(EntityType::Perspective, p.round, p.seq),
+            "round": p.round,
+            "seq": p.seq,
+            "label": p.label,
+            "content": p.content,
+            "contributors": p.contributors,
+            "status": p.status.as_str(),
+            "refs": p.refs,
+            "created_at": p.created_at.to_rfc3339(),
+        })).collect::<Vec<_>>(),
+        "tensions": tensions.iter().map(|t| json!({
+            "id": display_id(EntityType::Tension, t.round, t.seq),
+            "round": t.round,
+            "seq": t.seq,
+            "label": t.label,
+            "description": t.description,
+            "contributors": t.contributors,
+            "status": t.status.as_str(),
+            "refs": t.refs,
+            "created_at": t.created_at.to_rfc3339(),
+        })).collect::<Vec<_>>(),
+        "recommendations": recommendations.iter().map(|r| json!({
+            "id": display_id(EntityType::Recommendation, r.round, r.seq),
+            "round": r.round,
+            "seq": r.seq,
+            "label": r.label,
+            "content": r.content,
+            "contributors": r.contributors,
+            "parameters": r.parameters,
+            "status": r.status.as_str(),
+            "refs": r.refs,
+            "adopted_in_verdict": r.adopted_in_verdict,
+            "created_at": r.created_at.to_rfc3339(),
+        })).collect::<Vec<_>>(),
+        "evidence": evidence.iter().map(|e| json!({
+            "id": display_id(EntityType::Evidence, e.round, e.seq),
+            "round": e.round,
+            "seq": e.seq,
+            "label": e.label,
+            "content": e.content,
+            "contributors": e.contributors,
+            "status": e.status.as_str(),
+            "refs": e.refs,
+            "created_at": e.created_at.to_rfc3339(),
+        })).collect::<Vec<_>>(),
+        "claims": claims.iter().map(|c| json!({
+            "id": display_id(EntityType::Claim, c.round, c.seq),
+            "round": c.round,
+            "seq": c.seq,
+            "label": c.label,
+            "content": c.content,
+            "contributors": c.contributors,
+            "status": c.status.as_str(),
+            "refs": c.refs,
+            "created_at": c.created_at.to_rfc3339(),
+        })).collect::<Vec<_>>(),
+        "verdicts": verdicts.iter().map(|v| json!({
+            "verdict_id": v.verdict_id,
+            "verdict_type": v.verdict_type.as_str(),
+            "round": v.round,
+            "author_expert": v.author_expert,
+            "recommendation": v.recommendation,
+            "description": v.description,
+            "conditions": v.conditions,
+            "vote": v.vote,
+            "confidence": v.confidence,
+            "tensions_resolved": v.tensions_resolved,
+            "tensions_accepted": v.tensions_accepted,
+            "recommendations_adopted": v.recommendations_adopted,
+            "key_evidence": v.key_evidence,
+            "key_claims": v.key_claims,
+            "supporting_experts": v.supporting_experts,
+            "created_at": v.created_at.to_rfc3339(),
+        })).collect::<Vec<_>>(),
+        "exported_at": chrono::Utc::now().to_rfc3339(),
+    });
+
+    // Determine output path
+    let final_path = match output_path {
+        Some(p) => p.to_string(),
+        None => {
+            let dir = dialogue.output_dir.as_deref().unwrap_or("/tmp/blue-dialogue");
+            format!("{}/{}/dialogue.json", dir, dialogue_id)
+        }
+    };
+
+    // Ensure parent directory exists
+    if let Some(parent) = Path::new(&final_path).parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            ServerError::CommandFailed(format!("Failed to create output directory: {}", e))
+        })?;
+    }
+
+    // Write JSON file
+    let json_str = serde_json::to_string_pretty(&export_data).map_err(|e| {
+        ServerError::CommandFailed(format!("Failed to serialize export data: {}", e))
+    })?;
+
+    fs::write(&final_path, &json_str).map_err(|e| {
+        ServerError::CommandFailed(format!("Failed to write export file: {}", e))
+    })?;
+
+    Ok(json!({
+        "status": "success",
+        "message": format!("Exported dialogue '{}' to {}", dialogue_id, final_path),
+        "dialogue_id": dialogue_id,
+        "output_path": final_path,
+        "stats": {
+            "experts": experts.len(),
+            "perspectives": perspectives.len(),
+            "tensions": tensions.len(),
+            "recommendations": recommendations.len(),
+            "evidence": evidence.len(),
+            "claims": claims.len(),
+            "verdicts": verdicts.len(),
+        }
     }))
 }
 

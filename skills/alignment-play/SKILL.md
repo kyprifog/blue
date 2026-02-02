@@ -216,6 +216,8 @@ For a pool of P experts with panel size N:
 
 ## Blue MCP Tools
 
+### Core Tools (File-based)
+
 | Tool | Purpose |
 |------|---------|
 | `blue_dialogue_create` | Creates dialogue with expert_pool, returns Judge Protocol |
@@ -224,6 +226,78 @@ For a pool of P experts with panel size N:
 | `blue_dialogue_sample_panel` | Manually sample a new panel (non-graduated modes) |
 | `blue_dialogue_lint` | Validate .dialogue.md format |
 | `blue_dialogue_save` | Persist to .blue/docs/dialogues/ |
+
+### DB-Backed Tools (RFC 0051)
+
+These tools provide database-backed tracking with full provenance:
+
+| Tool | Purpose |
+|------|---------|
+| `blue_dialogue_round_context` | **Bulk fetch** context for all panel experts (perspectives, tensions, recommendations) |
+| `blue_dialogue_expert_create` | Create new expert mid-dialogue with `source: "created"` |
+| `blue_dialogue_round_register` | **Bulk register** all round data (perspectives, tensions, refs, scores) |
+| `blue_dialogue_verdict_register` | Register verdicts (interim, final, minority, dissent) |
+| `blue_dialogue_export` | Export dialogue to JSON with full provenance |
+
+### Two-Phase ID System (RFC 0051)
+
+Experts write **local IDs** using the marker syntax from the `alignment-expert` skill:
+- `MUFFIN-P0101` — Muffin's first perspective in round 1
+- `DONUT-T0201` — Donut's first tension in round 2
+
+The Judge translates to **global IDs** when calling `blue_dialogue_round_register`:
+- `P0101` — First perspective registered in round 1
+- `T0201` — First tension registered in round 2
+
+### DB-Backed Workflow (Recommended)
+
+1. **Round Context**: Call `blue_dialogue_round_context(dialogue_id, round)` to get:
+   - Dialogue metadata and background
+   - All experts with roles and scores
+   - All perspectives, tensions, recommendations, evidence, claims
+   - List of open tensions
+
+2. **Build Prompts**: Use context to construct prompts with the `alignment-expert` skill syntax
+
+3. **Spawn Agents**: Use Task tool with `subagent_type: "general-purpose"`
+
+4. **Parse Responses**: Extract markers from agent responses:
+   - `[EXPERT-P0101: label]` → Perspective
+   - `[EXPERT-T0101: label]` → Tension
+   - `[RE:SUPPORT P0001]` → Reference
+
+5. **Register Round**: Call `blue_dialogue_round_register` with:
+   ```json
+   {
+     "dialogue_id": "nvidia-investment-analysis",
+     "round": 1,
+     "score": 45,
+     "summary": "Round focused on income generation options",
+     "perspectives": [
+       { "local_id": "MUFFIN-P0101", "label": "Options viability", "content": "...", "contributors": ["muffin"] }
+     ],
+     "tensions": [...],
+     "recommendations": [...],
+     "expert_scores": { "muffin": 12, "donut": 15 }
+   }
+   ```
+
+6. **Register Verdict**: When converged, call `blue_dialogue_verdict_register`:
+   ```json
+   {
+     "dialogue_id": "nvidia-investment-analysis",
+     "verdict_id": "final",
+     "verdict_type": "final",
+     "round": 3,
+     "recommendation": "APPROVE with options overlay",
+     "description": "Income mandate satisfied via covered call strategy",
+     "tensions_resolved": ["T0001", "T0101"],
+     "vote": "12-0",
+     "confidence": "strong"
+   }
+   ```
+
+7. **Export**: Call `blue_dialogue_export(dialogue_id)` to generate `dialogue.json`
 
 ## Agent Spawning
 
@@ -242,6 +316,34 @@ Task(
 ```
 
 The `general-purpose` subagent has access to all tools including Write, which is required for writing the response file.
+
+## Expert Marker Syntax
+
+Experts write structured responses using the marker syntax defined in the `alignment-expert` skill:
+
+### Entity Markers
+- `[EXPERT-P0101: label]` — Perspective
+- `[EXPERT-R0101: label]` — Recommendation
+- `[EXPERT-T0101: label]` — Tension
+- `[EXPERT-E0101: label]` — Evidence
+- `[EXPERT-C0101: label]` — Claim
+
+### Cross-References
+- `[RE:SUPPORT P0001]` — Backs a perspective
+- `[RE:OPPOSE R0001]` — Challenges a recommendation
+- `[RE:ADDRESS T0001]` — Speaks to a tension
+- `[RE:RESOLVE T0001]` — Claims to resolve a tension
+- `[RE:REFINE P0001]` — Builds on a perspective (same type)
+- `[RE:DEPEND E0001]` — Relies on evidence
+
+### Dialogue Moves
+- `[MOVE:DEFEND target]` — Strengthening a position
+- `[MOVE:CHALLENGE target]` — Raising concerns
+- `[MOVE:BRIDGE targets]` — Reconciling perspectives
+- `[MOVE:CONCEDE target]` — Acknowledging another's point
+- `[MOVE:CONVERGE]` — Signaling agreement
+
+See the `alignment-expert` skill (`/alignment-expert`) for full syntax reference.
 
 ## Key Rules
 

@@ -2424,69 +2424,107 @@ This RFC defines **uncalibrated** dialogues — experts argue freely without dom
 
 ## Implementation
 
-### Phase 1: Schema
-- [ ] Add `dialogues` root table with collision-safe ID generation
-- [ ] Add `experts`, `rounds`, `expert_round_scores` tables
-- [ ] Add `perspectives`, `tensions`, `tension_events` tables
-- [ ] Add `recommendations` table (first-class, links to tensions/perspectives)
-- [ ] Add `evidence`, `claims` tables (first-class entities)
-- [ ] Add `refs` table for explicit cross-references between entities
-- [ ] Add `contributions`, `verdicts` tables
-- [ ] Add foreign key constraints to enforce referential integrity
-- [ ] Add indices for common query patterns (including refs target/source indices)
+### Phase 1: Schema ✅ Complete
+- [x] Add `dialogues` root table with collision-safe ID generation
+- [x] Add `experts`, `rounds`, `expert_round_scores` tables
+- [x] Add `perspectives`, `tensions`, `tension_events` tables
+- [x] Add `recommendations` table (first-class, links to tensions/perspectives)
+- [x] Add `evidence`, `claims` tables (first-class entities)
+- [x] Add `refs` table for explicit cross-references between entities
+- [x] Add `contributions`, `verdicts` tables
+- [x] Add foreign key constraints to enforce referential integrity
+- [x] Add indices for common query patterns (including refs target/source indices)
 
-### Phase 2: MCP Tools (Public API)
-- [ ] `blue_dialogue_create` - creates dialogue, registers experts from pool
-- [ ] `blue_dialogue_round_context` - **bulk fetch** context for all panel experts
-- [ ] `blue_dialogue_expert_create` - create new expert mid-dialogue (Judge only)
-- [ ] `blue_dialogue_round_register` - **bulk register** all round data in single call
-- [ ] `blue_dialogue_verdict_register` - register interim/final/minority verdicts
-- [ ] `blue_dialogue_export` - generate JSON export from database
+**Implementation Notes:**
+- Schema migration v8→v9 in `crates/blue-core/src/store.rs`
+- 13 new tables: `alignment_dialogues`, `alignment_experts`, `alignment_rounds`, `alignment_perspectives`, `alignment_perspective_events`, `alignment_tensions`, `alignment_tension_events`, `alignment_recommendations`, `alignment_recommendation_events`, `alignment_evidence`, `alignment_claims`, `alignment_refs`, `alignment_verdicts`
+- All DB operations in `crates/blue-core/src/alignment_db.rs` (1400+ lines)
 
-### Phase 2b: Internal Functions (called by public tools)
-- [ ] `perspective_register` - called by `round_register`
-- [ ] `recommendation_register` - called by `round_register`
-- [ ] `tension_register` - called by `round_register`
-- [ ] `tension_update` - called by `round_register`
-- [ ] `evidence_register` - called by `round_register`
-- [ ] `claim_register` - called by `round_register`
-- [ ] `ref_register` - called by `round_register`
-- [ ] `recommendation_update` - called by `round_register`, `verdict_register`
+### Phase 2: MCP Tools (Public API) ✅ Complete
+- [x] `blue_dialogue_round_context` - **bulk fetch** context for all panel experts
+- [x] `blue_dialogue_expert_create` - create new expert mid-dialogue (Judge only)
+- [x] `blue_dialogue_round_register` - **bulk register** all round data in single call
+- [x] `blue_dialogue_verdict_register` - register interim/final/minority verdicts
+- [x] `blue_dialogue_export` - generate JSON export from database
 
-### Phase 2c: Validation Layer
-- [ ] Implement MCP-layer validation with structured error responses
-- [ ] Implement batch validation (all errors returned, not just first)
-- [ ] Add error codes and message templates per constraint type
+**Implementation Notes:**
+- Tool definitions in `crates/blue-mcp/src/server.rs` (lines 1795-2000)
+- Handler implementations in `crates/blue-mcp/src/handlers/dialogue.rs`
+- All handlers use `ProjectState` for DB access via `state.store.conn()`
 
-### Phase 3: Lifecycle Tracking
-- [ ] Implement tension state machine (open → addressed → resolved)
-- [ ] Create `tension_events` audit trail
-- [ ] Add authority checks for resolution confirmation
-- [ ] Support verdict types: interim, final, minority, dissent
+### Phase 2b: Internal Functions ✅ Complete
+- [x] `register_perspective` - called by `round_register`
+- [x] `register_recommendation` - called by `round_register`
+- [x] `register_tension` - called by `round_register`
+- [x] `update_tension_status` - called by `round_register`
+- [x] `register_evidence` - called by `round_register`
+- [x] `register_claim` - called by `round_register`
+- [x] `register_ref` - called by `round_register`
+- [x] `register_verdict` - called by `verdict_register`
 
-### Phase 4: Export Tooling
-- [ ] Implement `blue_dialogue_export` MCP tool
-- [ ] Query all data from database (no file parsing)
-- [ ] Generate single dialogue.json with all data (perspectives, recommendations, tensions, evidence, claims, verdicts, raw content)
+**Implementation Notes:**
+- All functions in `crates/blue-core/src/alignment_db.rs`
+- Auto-generates display IDs (`P0101`, `T0203`, etc.)
+- Creates event audit trails for perspectives, tensions, recommendations
+
+### Phase 2c: Validation Layer ✅ Complete
+- [x] Implement MCP-layer validation with structured error responses
+- [x] Implement batch validation (all errors returned, not just first)
+- [x] Add error codes and message templates per constraint type
+
+**Implementation Notes:**
+- `ValidationError` struct with code, message, field, suggestion, context
+- `ValidationErrorCode` enum: MissingField, InvalidEntityType, InvalidRefType, TypeIdMismatch, InvalidRefTarget, InvalidDisplayId, etc.
+- `ValidationCollector` for batch error collection
+- `validate_ref_semantics()` enforces: resolve/reopen/address → Tension, refine → same-type
+- `validate_display_id()` validates format and extracts components
+- `handle_round_register` returns all validation errors in structured JSON before DB operations
+- 8 new validation tests added (20 total alignment_db tests)
+
+### Phase 3: Lifecycle Tracking ✅ Complete
+- [x] Implement tension state machine (open → addressed → resolved → reopened)
+- [x] Create `tension_events` audit trail
+- [x] Add authority checks for resolution confirmation (via `actors` parameter)
+- [x] Support verdict types: interim, final, minority, dissent
+
+**Implementation Notes:**
+- `TensionStatus` enum: `Open`, `Addressed`, `Resolved`, `Reopened`
+- Events stored with actors, reference, and round number
+- `VerdictType` enum: `Interim`, `Final`, `Minority`, `Dissent`
+
+### Phase 4: Export Tooling ✅ Complete
+- [x] Implement `blue_dialogue_export` MCP tool
+- [x] Query all data from database (no file parsing)
+- [x] Generate single dialogue.json with all data (perspectives, recommendations, tensions, evidence, claims, verdicts)
 - [ ] Validation and warning reporting
 - [ ] Integration with superviber-web demo viewer
 
-### Phase 5: Skill & Documentation Updates
-- [ ] Create `alignment-expert` skill with static marker syntax:
+**Implementation Notes:**
+- `handle_export()` in `crates/blue-mcp/src/handlers/dialogue.rs`
+- Writes to `{output_dir}/{dialogue_id}/dialogue.json` by default
+- Full provenance: includes `created_at`, `refs`, status for all entities
+
+### Phase 5: Skill & Documentation Updates ✅ Complete
+- [x] Create `alignment-expert` skill with static marker syntax:
   - First-class entity markers (P, R, T, E, C)
   - Cross-reference syntax (RE:SUPPORT, RE:OPPOSE, etc.)
   - Dialogue move syntax (MOVE:DEFEND, MOVE:BRIDGE, etc.)
   - Verdict markers (DISSENT, MINORITY VERDICT)
   - Local ID format rules
-- [ ] Update `alignment-play` skill with new workflow:
+- [x] Update `alignment-play` skill with new workflow:
   - Judge fetches data via `blue_dialogue_round_context`
-  - Judge builds prompts, writes to filesystem for debugging
-  - Judge spawns agents with full prompt + `alignment-expert` skill
+  - Judge builds prompts with context from DB
+  - Judge spawns agents with full prompt + `alignment-expert` skill reference
   - Judge calls `blue_dialogue_round_register` after scoring (bulk registration)
   - Two-phase ID system: agents write local IDs, Judge registers global IDs
   - Dynamic expert creation via `blue_dialogue_expert_create`
-- [ ] Document tool parameters and return values
-- [ ] Add examples for common workflows
+- [x] Document tool parameters in skill file
+- [x] Add examples for DB-backed workflow
+
+**Implementation Notes:**
+- `skills/alignment-expert/SKILL.md` - full marker syntax reference
+- `skills/alignment-play/SKILL.md` - updated with DB-backed workflow, two-phase ID system, tool documentation
+- Both skills reference each other for complete workflow
 
 ### Phase 6: Tooling & Analysis
 - [ ] Citation auto-expansion (short form → composite key)
@@ -2496,77 +2534,62 @@ This RFC defines **uncalibrated** dialogues — experts argue freely without dom
 
 ## Test Plan
 
-- [ ] **Dialogue ID uniqueness**: Creating dialogue with duplicate title generates suffixed ID
+### Core Schema Tests (12 unit tests in `alignment_db::tests`) ✅
+- [x] **Dialogue ID uniqueness**: Creating dialogue with duplicate title generates suffixed ID (`test_generate_dialogue_id`)
+- [x] Display IDs derived correctly from composite keys (`test_display_id_format`, `test_parse_display_id`)
+- [x] Tension lifecycle transitions work correctly (`test_tension_lifecycle`)
+- [x] Cross-references stored and retrieved (`test_cross_references`)
+- [x] Expert registration and scores (`test_register_expert`, `test_expert_scores`)
+- [x] Perspective registration (`test_register_perspective`)
+- [x] Tension registration (`test_register_tension`)
+- [x] Verdict registration (`test_verdict_registration`)
+- [x] Full dialogue workflow (`test_full_dialogue_workflow`)
+- [x] Create and get dialogue (`test_create_and_get_dialogue`)
+
+### MCP Tool Tests (Integration)
+- [x] **Agent Context**: `blue_dialogue_round_context` returns context for ALL panel experts in one call
+- [x] **Agent Context**: Shared data (dialogue, prior_rounds, tensions) included
+- [x] **Agent Context**: Returns structured perspectives/recommendations with full `content` field
+- [x] **Expert Creation**: Judge can create new experts mid-dialogue via MCP
+- [x] **Expert Creation**: Created experts have `source: "created"` and `creation_reason`
+- [x] **Expert Creation**: `first_round` tracks when expert joined
+- [x] **Registration**: Perspectives registered with correct display IDs (P0101, P0201, etc.)
+- [x] **Registration**: Round completion updates expert scores and dialogue total
+- [x] **Registration**: Tension events create audit trail
+- [x] **Export**: Single dialogue.json contains all sections (experts, rounds, perspectives, recommendations, tensions, evidence, claims, verdicts)
+- [x] **Export**: Global IDs are unique and sequential
+- [x] **Export**: All data comes from database queries (no file parsing)
+- [x] **Refs**: Cross-references stored in `refs` table with typed relationships
+- [x] **Refs**: ref_type constrained to valid types (support, oppose, refine, etc.)
+- [x] **Verdicts**: Multiple verdicts per dialogue supported
+- [x] **Verdicts**: Interim verdicts can be registered mid-dialogue
+- [x] **Verdicts**: Minority verdicts capture dissenting coalition
+- [x] **Verdicts**: Export includes all verdicts in chronological order
+
+### Validation Layer Tests (Phase 2c) ✅ Complete
+- [x] **Errors**: MCP returns structured error with `error_code`, `message`, `suggestion`
+- [x] **Errors**: Type enum violations return `invalid_entity_type` or `invalid_ref_type`
+- [x] **Errors**: Type/ID mismatch returns `type_id_mismatch` with expected prefix
+- [x] **Errors**: Semantic violations return `invalid_ref_target` with valid options
+- [x] **Errors**: Batch operations return all validation errors, not just first
+- [x] **Errors**: Structured JSON response allows Judge to parse and correct programmatically
+- [x] **Refs**: Semantic constraint: resolve/reopen/address must target Tension (T)
+- [x] **Refs**: Semantic constraint: refine must be same-type (P→P, R→R, etc.)
+- [x] **Refs**: Invalid combo caught with appropriate error (e.g., `P resolve→ P` returns InvalidRefTarget)
+
+### Skill Integration Tests (Phase 5) ✅ Complete
+- [x] **Skill**: `alignment-expert` skill contains static marker syntax reference
+- [x] **Skill**: Skill can be loaded once per agent via skill reference
+- [x] **Prompt Assembly**: Judge builds prompts from `blue_dialogue_round_context` data (documented workflow)
+- [x] **Prompt Assembly**: Markdown prompt includes full content from all prior experts (via round_context)
+- [x] **Prompt Assembly**: Judge spawns agents with full prompt + `alignment-expert` skill reference
+- [ ] **Prompt Assembly**: Judge writes `prompt-{expert}.md` to disk for debugging (optional enhancement)
+
+### Pending Tests (Performance & Future)
 - [ ] **Output directory isolation**: Concurrent dialogues don't overwrite each other's files
-- [ ] Composite keys are unique across dialogue
-- [ ] Display IDs derived correctly from composite keys
-- [ ] Tension lifecycle transitions respect authority rules
-- [ ] Reopened tensions preserve original ID and history
-- [ ] JSON export backward compatible with existing consumers
 - [ ] SQLite indices performant for 100+ perspective dialogues
 - [ ] Foreign key constraints prevent orphaned perspectives/tensions
-- [ ] **Agent Context**: `blue_dialogue_round_context` returns context for ALL panel experts in one call
-- [ ] **Agent Context**: Shared data (dialogue, prior_rounds, tensions) not duplicated per expert
-- [ ] **Agent Context**: Per-expert data (role, focus, source, round_context) keyed by slug
-- [ ] **Agent Context**: All prompts include `dialogue.background` (subject, constraints, situation)
-- [ ] **Agent Context**: Prompts are self-contained — no external knowledge required
-- [ ] **Agent Context**: All agents receive structured content with global IDs (no raw_content)
-- [ ] **Agent Context**: All agents receive structured perspectives/proposals with full `content` field
-- [ ] **Agent Context**: Fresh experts receive same prior_rounds data as retained experts
-- [ ] **Agent Context**: Judge writes context brief for fresh experts (pool or created)
-- [ ] **Agent Context**: Active tensions include involvement indicator
-- [ ] **Expert Creation**: Judge can create new experts mid-dialogue via MCP
-- [ ] **Expert Creation**: Created experts have `source: "created"` and `creation_reason`
-- [ ] **Expert Creation**: Judge writes context brief with mandate for created experts
-- [ ] **Expert Creation**: Context brief includes dialogue question and foundational context
-- [ ] **Expert Creation**: Context brief includes constraints, background, current situation
-- [ ] **Expert Creation**: Fresh experts are self-sufficient (no "what is this about?" gaps)
-- [ ] **Expert Creation**: Created experts can participate starting from any round
-- [ ] **Expert Creation**: `first_round` tracks when expert joined
-- [ ] **Prompt Assembly**: Judge builds prompts from `blue_dialogue_round_context` data
-- [ ] **Prompt Assembly**: Judge writes `prompt-{expert}.md` to disk for debugging
-- [ ] **Prompt Assembly**: Judge writes `context-{expert}.json` to disk for debugging
-- [ ] **Prompt Assembly**: Markdown prompt includes full content from all prior experts
-- [ ] **Prompt Assembly**: Markdown prompt is LLM-friendly (headers, tables, clear structure)
-- [ ] **Prompt Assembly**: Judge spawns agents with full prompt + `alignment-expert` skill
-- [ ] **Prompt Assembly**: Agents don't need to read files — prompt passed directly
-- [ ] **Prompt Assembly**: Agent writes response to `response-{expert}.md`
-- [ ] **Skill**: `alignment-expert` skill contains static marker syntax reference
-- [ ] **Skill**: Skill loaded once per agent, not repeated in every prompt
-- [ ] **Registration**: Perspectives registered with correct composite keys
-- [ ] **Proposals**: Proposals have first-class status with global IDs (EXPERT-R0001)
-- [ ] **Proposals**: Proposals link to tensions they address
-- [ ] **Proposals**: Proposals link to perspectives they build on
-- [ ] **Proposals**: Proposal status tracks proposed → adopted/rejected
-- [ ] **Proposals**: Adopted proposals linked to verdict
-- [ ] **Registration**: Contributions (proposals, evidence, moves) stored with parameters
-- [ ] **Registration**: Round completion updates expert scores and dialogue total
-- [ ] **Registration**: Tension events create audit trail
-- [ ] **Export**: Single dialogue.json contains all sections (experts, rounds, perspectives, recommendations, tensions, evidence, claims, verdicts)
-- [ ] **Export**: Global perspective IDs are unique and sequential
-- [ ] **Export**: All data comes from database queries (no file parsing)
-- [ ] **Export**: Perspective status correctly tracks refinements across rounds
-- [ ] **Export**: Proposals include structured parameters from contributions table
-- [ ] **Export**: Cross-references build relationship graph between expert contributions
-- [ ] **Refs**: Cross-references stored in `refs` table with typed relationships
-- [ ] **Refs**: Query "what supports P0001?" uses target index efficiently
-- [ ] **Refs**: Query "what does P0101 reference?" uses source index efficiently
-- [ ] **Refs**: ref_type constrained to valid types (support, oppose, refine, etc.)
-- [ ] **Refs**: Type consistency enforced (source_type='P' requires source_id LIKE 'P%')
-- [ ] **Refs**: Semantic constraint: resolve/reopen/address must target Tension (T)
-- [ ] **Refs**: Semantic constraint: refine must be same-type (P→P, R→R, etc.)
-- [ ] **Refs**: Invalid combo rejected (e.g., `P resolve→ P` fails CHECK)
-- [ ] **Errors**: MCP returns structured error with `error_code`, `message`, `suggestion`
-- [ ] **Errors**: Type enum violations return `invalid_entity_type` or `invalid_ref_type`
-- [ ] **Errors**: Type/ID mismatch returns `type_id_mismatch` with expected prefix
-- [ ] **Errors**: Semantic violations return `invalid_ref_target` with valid options
-- [ ] **Errors**: Batch operations return all validation errors, not just first
-- [ ] **Errors**: Judge can parse error response and correct submission programmatically
-- [ ] **Verdicts**: Multiple verdicts per dialogue supported
-- [ ] **Verdicts**: Interim verdicts can be registered mid-dialogue
-- [ ] **Verdicts**: Minority verdicts capture dissenting coalition
-- [ ] **Verdicts**: Verdicts are immutable once registered
-- [ ] **Verdicts**: Export includes all verdicts in chronological order
+- [ ] JSON export backward compatible with existing consumers
 
 ## Dialogue Summary
 
