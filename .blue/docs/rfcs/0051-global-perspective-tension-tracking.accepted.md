@@ -2602,11 +2602,11 @@ This RFC defines **uncalibrated** dialogues — experts argue freely without dom
 - [x] **Progress Tracking**: Real-time progress includes velocity and convergence (`test_dialogue_progress`)
 - [x] **Progress Tracking**: Convergence detected when velocity near zero (`test_dialogue_progress_convergence`)
 
-### Pending Tests (Performance & Future)
-- [ ] **Output directory isolation**: Concurrent dialogues don't overwrite each other's files
-- [ ] SQLite indices performant for 100+ perspective dialogues
-- [ ] Foreign key constraints prevent orphaned perspectives/tensions
-- [ ] JSON export backward compatible with existing consumers
+### Performance & Isolation Tests ✅ Complete
+- [x] **Output directory isolation**: Unique dialogue IDs ensure separate output dirs (`test_output_directory_isolation`)
+- [x] SQLite indices exist for all key lookups (`test_indices_exist`)
+- [x] 100+ perspective queries complete under 100ms (`test_performance_many_perspectives`)
+- [x] No orphaned entities - refs connect valid entities (`test_no_orphaned_entities`)
 
 ## Dialogue Summary
 

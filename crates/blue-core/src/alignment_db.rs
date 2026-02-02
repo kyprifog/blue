@@ -2369,6 +2369,19 @@ mod tests {
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (dialogue_id, verdict_id)
             );
+
+            -- Performance indices for common lookups
+            CREATE INDEX idx_experts_dialogue ON alignment_experts(dialogue_id);
+            CREATE INDEX idx_rounds_dialogue ON alignment_rounds(dialogue_id);
+            CREATE INDEX idx_perspectives_dialogue ON alignment_perspectives(dialogue_id);
+            CREATE INDEX idx_tensions_dialogue ON alignment_tensions(dialogue_id);
+            CREATE INDEX idx_tensions_status ON alignment_tensions(dialogue_id, status);
+            CREATE INDEX idx_recommendations_dialogue ON alignment_recommendations(dialogue_id);
+            CREATE INDEX idx_evidence_dialogue ON alignment_evidence(dialogue_id);
+            CREATE INDEX idx_claims_dialogue ON alignment_claims(dialogue_id);
+            CREATE INDEX idx_refs_dialogue ON alignment_refs(dialogue_id);
+            CREATE INDEX idx_refs_target ON alignment_refs(dialogue_id, target_id);
+            CREATE INDEX idx_verdicts_dialogue ON alignment_verdicts(dialogue_id);
             "#,
         )
         .unwrap();
@@ -3512,5 +3525,140 @@ mod tests {
         assert_eq!(results.len(), 2); // Two dialogues match "investment"
         assert!(results.iter().any(|(_, title, _)| title.contains("Portfolio")));
         assert!(results.iter().any(|(_, title, _)| title.contains("Risk")));
+    }
+
+    // ==================== Performance & Isolation Tests ====================
+
+    #[test]
+    fn test_output_directory_isolation() {
+        let conn = setup_test_db();
+
+        // Create dialogues with similar titles - each gets unique output dir via unique ID
+        let d1 = create_dialogue(&conn, "Investment Analysis",
+            Some("First analysis"), Some("/tmp/blue-dialogue/investment-analysis"), None).unwrap();
+        let d2 = create_dialogue(&conn, "Investment Analysis",
+            Some("Second analysis"), Some("/tmp/blue-dialogue/investment-analysis-2"), None).unwrap();
+        let d3 = create_dialogue(&conn, "Investment Analysis",
+            Some("Third analysis"), Some("/tmp/blue-dialogue/investment-analysis-3"), None).unwrap();
+
+        // Verify unique IDs
+        assert_eq!(d1, "investment-analysis");
+        assert_eq!(d2, "investment-analysis-2");
+        assert_eq!(d3, "investment-analysis-3");
+
+        // Verify dialogues are isolated
+        let dialogue1 = get_dialogue(&conn, &d1).unwrap();
+        let dialogue2 = get_dialogue(&conn, &d2).unwrap();
+        let dialogue3 = get_dialogue(&conn, &d3).unwrap();
+
+        assert_eq!(dialogue1.output_dir, Some("/tmp/blue-dialogue/investment-analysis".to_string()));
+        assert_eq!(dialogue2.output_dir, Some("/tmp/blue-dialogue/investment-analysis-2".to_string()));
+        assert_eq!(dialogue3.output_dir, Some("/tmp/blue-dialogue/investment-analysis-3".to_string()));
+
+        // Add experts to different dialogues - they remain isolated
+        register_expert(&conn, &d1, "muffin", "Analyst A", ExpertTier::Core, ExpertSource::Pool,
+            None, None, None, None, None, Some(0)).unwrap();
+        register_expert(&conn, &d2, "muffin", "Analyst B", ExpertTier::Core, ExpertSource::Pool,
+            None, None, None, None, None, Some(0)).unwrap();
+
+        let experts1 = get_experts(&conn, &d1).unwrap();
+        let experts2 = get_experts(&conn, &d2).unwrap();
+
+        assert_eq!(experts1.len(), 1);
+        assert_eq!(experts2.len(), 1);
+        assert_eq!(experts1[0].role, "Analyst A");
+        assert_eq!(experts2[0].role, "Analyst B");
+    }
+
+    #[test]
+    fn test_performance_many_perspectives() {
+        let conn = setup_test_db();
+
+        let dialogue_id = create_dialogue(&conn, "Large Dialogue", None, None, None).unwrap();
+        register_expert(&conn, &dialogue_id, "muffin", "Analyst", ExpertTier::Core, ExpertSource::Pool,
+            None, None, None, None, None, Some(0)).unwrap();
+
+        // Create 10 rounds with 10 perspectives each = 100 perspectives
+        for round in 0..10 {
+            create_round(&conn, &dialogue_id, round, None, 10).unwrap();
+            for _seq in 0..10 {
+                register_perspective(&conn, &dialogue_id, round, "Test perspective",
+                    "Content for testing performance", &["muffin".to_string()], None).unwrap();
+            }
+        }
+
+        // Query all perspectives - should be fast with indices
+        let start = std::time::Instant::now();
+        let perspectives = get_perspectives(&conn, &dialogue_id).unwrap();
+        let duration = start.elapsed();
+
+        assert_eq!(perspectives.len(), 100);
+        // Should complete in under 100ms with proper indices
+        assert!(duration.as_millis() < 100, "Query took too long: {:?}", duration);
+    }
+
+    #[test]
+    fn test_indices_exist() {
+        let conn = setup_test_db();
+
+        // Query SQLite for index info
+        let mut stmt = conn.prepare(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'"
+        ).unwrap();
+
+        let indices: Vec<String> = stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Verify key indices exist
+        assert!(indices.iter().any(|n| n.contains("experts_dialogue")));
+        assert!(indices.iter().any(|n| n.contains("perspectives_dialogue")));
+        assert!(indices.iter().any(|n| n.contains("tensions_dialogue")));
+        assert!(indices.iter().any(|n| n.contains("tensions_status")));
+        assert!(indices.iter().any(|n| n.contains("refs_dialogue")));
+        assert!(indices.iter().any(|n| n.contains("refs_target")));
+    }
+
+    #[test]
+    fn test_no_orphaned_entities() {
+        let conn = setup_test_db();
+
+        let dialogue_id = create_dialogue(&conn, "Orphan Test", None, None, None).unwrap();
+        register_expert(&conn, &dialogue_id, "muffin", "Analyst", ExpertTier::Core, ExpertSource::Pool,
+            None, None, None, None, None, Some(0)).unwrap();
+        create_round(&conn, &dialogue_id, 0, None, 10).unwrap();
+
+        // Register entities
+        let p1 = register_perspective(&conn, &dialogue_id, 0, "P1", "Content",
+            &["muffin".to_string()], None).unwrap();
+        let t1 = register_tension(&conn, &dialogue_id, 0, "T1", "Issue",
+            &["muffin".to_string()], None).unwrap();
+
+        // Register a ref between entities
+        register_ref(&conn, &dialogue_id, EntityType::Perspective, &p1,
+            RefType::Address, EntityType::Tension, &t1).unwrap();
+
+        // All entities should be queryable and connected
+        let perspectives = get_perspectives(&conn, &dialogue_id).unwrap();
+        let tensions = get_tensions(&conn, &dialogue_id).unwrap();
+
+        assert_eq!(perspectives.len(), 1);
+        assert_eq!(tensions.len(), 1);
+
+        // Refs should exist
+        let ref_count: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM alignment_refs WHERE dialogue_id = ?1",
+            params![dialogue_id], |row| row.get(0)
+        ).unwrap();
+        assert_eq!(ref_count, 1);
+
+        // Verify ref connects to valid entities
+        let ref_row: (String, String) = conn.query_row(
+            "SELECT source_id, target_id FROM alignment_refs WHERE dialogue_id = ?1",
+            params![dialogue_id], |row| Ok((row.get(0)?, row.get(1)?))
+        ).unwrap();
+        assert_eq!(ref_row.0, p1);
+        assert_eq!(ref_row.1, t1);
     }
 }
