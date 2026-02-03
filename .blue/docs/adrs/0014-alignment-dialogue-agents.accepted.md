@@ -125,16 +125,22 @@ Unbounded scoring:
 - Reflects reality: there's always more ALIGNMENT to achieve
 - Makes velocity meaningful: +2 vs +20 tells you something
 
-### ALIGNMENT Velocity
+### ALIGNMENT Velocity (Updated: RFC 0057)
 
-The dialogue tracks cumulative ALIGNMENT:
+The dialogue tracks cumulative ALIGNMENT and convergence metrics:
 
 ```
 Total ALIGNMENT = Σ(all turn scores)
-ALIGNMENT Velocity = score(round N) - score(round N-1)
+Velocity = open_tensions + new_perspectives
 ```
 
-When **ALIGNMENT Velocity approaches zero**, the dialogue is converging. New rounds aren't adding perspectives. Time to finalize.
+**Velocity** measures "work remaining" — the number of unresolved tensions plus new perspectives surfaced this round. When **Velocity = 0**, all tensions are resolved and no new perspectives are emerging.
+
+**Convergence requires:**
+- Velocity = 0 (no work remaining)
+- 100% of experts signal `[MOVE:CONVERGE]`
+
+This is stricter than the original score-delta definition, ensuring dialogues don't converge prematurely with open tensions.
 
 ## The Agents
 
@@ -237,11 +243,10 @@ The 💙 loves them all. Wants them all to shine. Helps them find the most align
 │                      └─────────────┘                                │
 │                                                                      │
 │  EACH ROUND: Spawn N agents IN PARALLEL                             │
-│  LOOP until:                                                         │
-│  - ALIGNMENT Plateau (velocity ≈ 0)                                 │
-│  - All tensions resolved                                             │
-│  - 💙 declares convergence                                          │
-│  - Max rounds reached (safety valve)                                │
+│  LOOP until (RFC 0057):                                              │
+│  - Velocity = 0 (open_tensions + new_perspectives)                  │
+│  - 100% experts signal [MOVE:CONVERGE]                              │
+│  - Max rounds reached (10, safety valve)                            │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -406,15 +411,21 @@ The N-agent parallel architecture provides:
 - No race conditions (all write to separate outputs, Judge merges)
 - Claude Code's Task tool supports parallel spawning natively
 
-## Convergence Criteria
+## Convergence Criteria (Updated: RFC 0057)
 
-The 💙 declares convergence when ANY of:
+The 💙 declares convergence when **ALL** of:
 
-1. **ALIGNMENT Plateau** - Velocity ≈ 0 for two consecutive rounds (across all N agents)
-2. **Full Coverage** - Perspectives Inventory has no ✗ items (all integrated or consciously deferred)
-3. **Zero Tensions** - All `[TENSION]` markers have matching `[RESOLVED]`
-4. **Mutual Recognition** - Majority of 🧁s state they believe ALIGNMENT has been reached
-5. **Max Rounds** - Safety valve (default: 5 rounds)
+1. **Velocity = 0** - `open_tensions + new_perspectives == 0` ("work remaining" is zero)
+2. **Unanimous Recognition** - 100% of 🧁s signal `[MOVE:CONVERGE]`
+
+Plus safety valve:
+3. **Max Rounds** - 10 rounds (forces convergence with warning)
+
+**Key changes from original (RFC 0057):**
+- Velocity redefined as `open_tensions + new_perspectives` (not score delta)
+- Unanimous expert agreement required (not majority)
+- Both conditions must be true (AND, not OR)
+- Max rounds increased from 5 to 10
 
 The 💙 can also **extend** the dialogue if it sees unincorporated perspectives that no 🧁 has surfaced.
 

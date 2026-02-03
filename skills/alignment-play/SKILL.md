@@ -22,7 +22,7 @@ Orchestrate multi-expert alignment dialogues using the N+1 agent architecture fr
 |-----------|---------|-------------|
 | `--panel-size` | pool size or 12 | Number of experts per round |
 | `--rotation` | `graduated` | Rotation mode: **graduated** (default), none, wildcards, full |
-| `--max-rounds` | `12` | Maximum rounds before stopping |
+| `--max-rounds` | `10` | Maximum rounds before stopping (RFC 0057) |
 | `--rfc` | none | Link dialogue to an RFC |
 
 ## How It Works
@@ -75,7 +75,7 @@ The suggested panel is just that — a suggestion. **Review it before Round 0:**
 
 ```json
 {
-  "output_dir": "/tmp/blue-dialogue/data-design",
+  "output_dir": ".blue/dialogues/data-design",
   "round": 0,
   "panel": [
     { "name": "Muffin", "role": "API Architect", "source": "pool" },
@@ -105,7 +105,7 @@ Use `blue_dialogue_evolve_panel` to specify your panel:
 
 ```json
 {
-  "output_dir": "/tmp/blue-dialogue/investment-strategy",
+  "output_dir": ".blue/dialogues/investment-strategy",
   "round": 1,
   "panel": [
     { "name": "Muffin", "role": "Value Analyst", "source": "retained" },
@@ -120,7 +120,7 @@ Then spawn the panel using `blue_dialogue_round_prompt` with the `expert_source`
 
 ```
 blue_dialogue_round_prompt(
-  output_dir="/tmp/blue-dialogue/investment-strategy",
+  output_dir=".blue/dialogues/investment-strategy",
   agent_name="Palmier",
   agent_emoji="🧁",
   agent_role="Geopolitical Risk Analyst",
@@ -354,6 +354,94 @@ See the `alignment-expert` skill (`/alignment-expert`) for full syntax reference
 5. **Spawn ALL agents in ONE message** — No first-mover advantage
 6. **Follow the Judge Protocol exactly** — It contains the round workflow, artifact writing steps, scoring rules, and convergence criteria
 7. **Use `general-purpose` subagent_type** — NOT `alignment-expert`. The general-purpose agents have access to all tools including Write, which is required for file output
+8. **TRACK VELOCITY CORRECTLY** — Velocity = open_tensions + new_perspectives. This is "work remaining," not score delta. Convergence requires velocity = 0. (RFC 0057)
+9. **REQUIRE UNANIMOUS CONVERGENCE** — All experts must signal `[MOVE:CONVERGE]` before declaring convergence. 100%, not majority. (RFC 0057)
+10. **BOTH CONDITIONS REQUIRED** — Convergence requires BOTH velocity = 0 AND 100% expert convergence. Either condition failing means another round. (RFC 0057)
+11. **MAX ROUNDS = 10** — Safety valve. If round 10 completes without convergence, force it with a warning in the verdict. (RFC 0057)
+12. **OUTPUT CONVERGENCE SUMMARY** — When convergence achieved, output the formatted summary table showing: rounds, total ALIGNMENT (with W/C/T/R breakdown), experts consulted, tensions resolved, converged decisions, and resolved tensions. (RFC 0057)
+
+## Driving Velocity to Zero (RFC 0057)
+
+When velocity > 0 after a round, the Judge must drive it down:
+
+### If Open Tensions > 0:
+1. **Audit**: List tensions without `[RE:RESOLVE]` or `[ACCEPTED UNRESOLVED]`
+2. **Assign Ownership**: Each tension needs an expert responsible for resolution
+3. **Evolve Panel if Needed**: Pull from pool or create targeted expert
+4. **Spawn Round**: Prompts emphasize tension resolution
+
+### If New Perspectives > 0:
+1. **Assess**: Are these perspectives being integrated or creating new tensions?
+2. **If creating tensions**: Address tensions first
+3. **If integrating smoothly**: Continue — perspectives will stop emerging as coverage completes
+
+### If Converge % < 100%:
+1. **Identify Holdouts**: Which experts haven't signaled `[MOVE:CONVERGE]`?
+2. **Understand Why**: Are they defending open tensions? Surfacing new perspectives?
+3. **Address Root Cause**: Usually ties back to velocity > 0
+
+## Scoreboard Format (RFC 0057)
+
+Track both ALIGNMENT components (W/C/T/R) and convergence metrics:
+
+```markdown
+| Round | W | C | T | R | Score | Open Tensions | New Perspectives | Velocity | Converge % |
+|-------|---|---|---|---|-------|---------------|------------------|----------|------------|
+| 0     | 45| 30| 25| 25| 125   | 3             | 8                | 11       | 0%         |
+| 1     | 32| 22| 18| 17| 89    | 1             | 2                | 3        | 50%        |
+| 2     | 18| 12| 8 | 7 | 45    | 0             | 0                | 0        | 100%       |
+
+**Total ALIGNMENT:** 259 (W:95 C:64 T:51 R:49)
+**Max Rounds:** 10
+**Convergence:** ✓ (velocity=0, unanimous)
+```
+
+- **W** = Wisdom (perspectives integrated, synthesis quality)
+- **C** = Consistency (follows patterns, internally coherent)
+- **T** = Truth (grounded in reality, no contradictions)
+- **R** = Relationships (connections to other artifacts, graph completeness)
+
+## Convergence Summary Template (RFC 0057)
+
+When convergence is achieved, output this summary:
+
+```
+100% CONVERGENCE ACHIEVED
+
+Final Dialogue Summary
+┌───────────────────────┬───────────┐
+│        Metric         │   Value   │
+├───────────────────────┼───────────┤
+│ Rounds                │ 3         │
+├───────────────────────┼───────────┤
+│ Total ALIGNMENT       │ 289       │
+│   (W:98 C:72 T:65 R:54)           │
+├───────────────────────┼───────────┤
+│ Experts Consulted     │ 10 unique │
+├───────────────────────┼───────────┤
+│ Tensions Resolved     │ 6/6       │
+├───────────────────────┼───────────┤
+│ Final Velocity        │ 0         │
+└───────────────────────┴───────────┘
+
+Converged Decisions
+┌────────────────┬────────────────────────────────────────────────────┐
+│   Topic        │                      Decision                      │
+├────────────────┼────────────────────────────────────────────────────┤
+│ Architecture   │ Storage abstraction with provider trait            │
+├────────────────┼────────────────────────────────────────────────────┤
+│ Testing        │ NIST KAT + reference vectors + property tests      │
+└────────────────┴────────────────────────────────────────────────────┘
+
+Resolved Tensions
+┌────────┬────────────────────────────────────────────────────────────┐
+│   ID   │                       Resolution                           │
+├────────┼────────────────────────────────────────────────────────────┤
+│ T0001  │ Local keys never rotated - disposable with DB reset        │
+└────────┴────────────────────────────────────────────────────────────┘
+
+All experts signaled [MOVE:CONVERGE]. Velocity = 0.
+```
 
 ## The Spirit of the Dialogue
 

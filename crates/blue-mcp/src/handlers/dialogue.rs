@@ -15,11 +15,14 @@ use blue_core::alignment_db::{
     ValidationError, ValidationCollector,
     validate_ref_semantics, validate_display_id,
     get_dialogue, register_expert, get_experts,
-    create_round, register_perspective, register_tension,
+    create_round_with_metrics, register_perspective, register_tension,
     register_recommendation, register_evidence, register_claim, register_ref,
     register_verdict, update_tension_status, update_expert_score,
     get_perspectives, get_tensions, get_recommendations, get_evidence, get_claims, get_verdicts,
     display_id, parse_display_id,
+    // RFC 0057: Convergence discipline
+    ScoreComponents, ConvergenceMetrics,
+    can_dialogue_converge, get_scoreboard,
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -557,8 +560,9 @@ pub fn handle_create(state: &mut ProjectState, args: &Value) -> Result<Value, Se
 
     // Build response — RFC 0023: inject protocol as prose in message field
     let (message, judge_protocol) = if let Some(ref agents) = pastry_agents {
-        // RFC 0029: Create output directory for file-based subagent output
-        let output_dir = format!("/tmp/blue-dialogue/{}", slug);
+        // RFC 0057: Create output directory in .blue/dialogues/<ISO>-<name>/
+        // Format: .blue/dialogues/2026-02-03T1423Z-topic-name/
+        let output_dir = format!(".blue/dialogues/{}-{}", timestamp, slug);
         fs::create_dir_all(&output_dir).map_err(|e| {
             ServerError::CommandFailed(format!("Failed to create output dir {}: {}", output_dir, e))
         })?;
@@ -1340,9 +1344,37 @@ All {agent_count} results return when complete WITH STRUCTURED CONFIRMATIONS.
    - Updated Perspectives Inventory (one row per [PERSPECTIVE Pnn:] marker)
    - Updated Tensions Tracker (one row per [TENSION Tn:] marker)
    Full agent responses stay in {output_dir}/round-N/*.md (ADR 0005: reference, don't copy).
-7. CONVERGE: If velocity approaches 0 OR all tensions resolved → declare convergence
-   Otherwise, start next round (agents will read Step 5 artifacts via CONTEXT_INSTRUCTIONS).
-   Maximum 5 rounds (safety valve)
+7. CONVERGENCE CHECK (RFC 0057) — BOTH CONDITIONS REQUIRED:
+   a. Calculate VELOCITY = open_tensions + new_perspectives
+      - Count open/reopened tensions (not resolved or accepted)
+      - Count new perspectives surfaced THIS round
+   b. Calculate CONVERGE % = (experts_signaling_converge / panel_size) × 100
+      - Expert signals convergence via `[MOVE:CONVERGE]` marker in their response
+   c. Convergence ONLY when: velocity == 0 AND converge_percent == 100%
+   d. If velocity > 0: Start next round to resolve tensions/perspectives
+   e. If converge < 100%: Start next round — experts not aligned
+   f. Maximum 10 rounds (safety valve) — force convergence with warning
+
+=== SCOREBOARD FORMAT (RFC 0057) ===
+
+The scoreboard tracks ALIGNMENT progress AND convergence metrics.
+
+```markdown
+| Round | W | C | T | R | Score | Σ | Open T | New P | Velocity | Converge % |
+|-------|---|---|---|---|-------|---|--------|-------|----------|------------|
+| 0     | 5 | 3 | 4 | 2 | 14    |14 | 3      | 5     | 8        | 0%         |
+| 1     | 8 | 4 | 5 | 3 | 20    |34 | 1      | 2     | 3        | 50%        |
+| 2     | 4 | 2 | 2 | 1 | 9     |43 | 0      | 0     | 0        | 100%       |
+```
+
+Columns:
+- W/C/T/R: Wisdom, Consistency, Truth, Relationships (ALIGNMENT components)
+- Score: This round's total (W+C+T+R)
+- Σ: Cumulative total score
+- Open T: Open tensions count (velocity component 1)
+- New P: New perspectives this round (velocity component 2)
+- Velocity: Open T + New P (must be 0 to converge)
+- Converge %: Experts signaling `[MOVE:CONVERGE]` / panel size × 100
 
 === TOKEN BUDGET ===
 
@@ -1352,6 +1384,7 @@ Both well under 25K limit. Opus usage minimized.
 
 AGENTS: {agent_names}
 OUTPUT DIR: {output_dir}
+MAX ROUNDS: 10
 
 FORMAT RULES — MANDATORY:
 - ALWAYS prefix agent names with their emoji (🧁 Muffin) not bare name (Muffin)
@@ -1359,8 +1392,9 @@ FORMAT RULES — MANDATORY:
 - Expert Panel table columns: Agent | Role | Tier | Relevance | Emoji
 - Round headers use emoji prefix (### 🧁 Muffin)
 - Scores start at 0 — only fill after reading agent returns
+- Scoreboard MUST include all RFC 0057 columns (W/C/T/R, Velocity, Converge %)
 
-NOTE: blue_dialogue_round_prompt handles round-specific context automatically:
+NOTE: blue_dialogue_round_prompt handles round-specific context (CONTEXT_INSTRUCTIONS) automatically:
 - Round 0: No context instructions (agents have no memory of each other)
 - Round 1+: Automatically includes READ CONTEXT block with correct paths"##,
         agent_count = agents.len(),
@@ -1438,10 +1472,14 @@ You are not limited to the initial pool. If the dialogue surfaces a perspective 
         "sources": sources,
         "output_dir": output_dir,
         "rotation": format!("{:?}", rotation).to_lowercase(),
+        // RFC 0057: Updated convergence params
         "convergence": {
-            "max_rounds": 5,
-            "velocity_threshold": 0.1,
+            "max_rounds": 10,
             "tension_resolution_gate": true,
+            // Velocity is now: open_tensions + new_perspectives (not threshold-based)
+            "velocity_formula": "open_tensions + new_perspectives",
+            // Convergence requires: velocity == 0 AND converge_percent == 100%
+            "convergence_formula": "velocity == 0 AND converge_percent == 100%",
         },
     });
 
@@ -2047,6 +2085,31 @@ pub fn handle_round_context(state: &ProjectState, args: &Value) -> Result<Value,
     let verdicts = get_verdicts(conn, dialogue_id)
         .map_err(|e| ServerError::CommandFailed(format!("Failed to get verdicts: {}", e)))?;
 
+    // RFC 0057: Get scoreboard and convergence status
+    let scoreboard = get_scoreboard(conn, dialogue_id)
+        .map_err(|e| ServerError::CommandFailed(format!("Failed to get scoreboard: {}", e)))?;
+
+    let (can_converge, blockers) = can_dialogue_converge(conn, dialogue_id)
+        .map_err(|e| ServerError::CommandFailed(format!("Failed to check convergence: {}", e)))?;
+
+    let last_round_metrics = scoreboard.last().map(|r| json!({
+        "round": r.round,
+        "score": {
+            "W": r.w,
+            "C": r.c,
+            "T": r.t,
+            "R": r.r,
+            "total": r.total,
+        },
+        "velocity": r.velocity,
+        "open_tensions": r.open_tensions,
+        "new_perspectives": r.new_perspectives,
+        "converge_signals": r.converge_signals,
+        "panel_size": r.panel_size,
+        "converge_percent": r.converge_percent,
+        "cumulative_score": r.cumulative_score,
+    }));
+
     // Build context response
     Ok(json!({
         "status": "success",
@@ -2058,6 +2121,12 @@ pub fn handle_round_context(state: &ProjectState, args: &Value) -> Result<Value,
             "status": dialogue.status.as_str(),
             "total_rounds": dialogue.total_rounds,
             "total_alignment": dialogue.total_alignment,
+        },
+        // RFC 0057: Convergence status
+        "convergence": {
+            "can_converge": can_converge,
+            "blockers": blockers,
+            "last_round": last_round_metrics,
         },
         "experts": experts.iter().map(|e| json!({
             "expert_slug": e.expert_slug,
@@ -2407,6 +2476,33 @@ pub fn handle_round_register(state: &ProjectState, args: &Value) -> Result<Value
 
     let summary = args.get("summary").and_then(|v| v.as_str());
 
+    // RFC 0057: Parse score components (W/C/T/R breakdown)
+    let score_components = args.get("score_components").map(|sc| ScoreComponents {
+        wisdom: sc.get("wisdom").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+        consistency: sc.get("consistency").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+        truth: sc.get("truth").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+        relationships: sc.get("relationships").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+    });
+
+    // RFC 0057: Parse convergence metrics
+    let convergence_metrics = {
+        let open_tensions = args.get("open_tensions").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+        let new_perspectives = args.get("new_perspectives").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+        let converge_signals = args.get("converge_signals").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+        let panel_size = args.get("panel_size").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+
+        if open_tensions > 0 || new_perspectives > 0 || converge_signals > 0 || panel_size > 0 {
+            Some(ConvergenceMetrics {
+                open_tensions,
+                new_perspectives,
+                converge_signals,
+                panel_size,
+            })
+        } else {
+            None
+        }
+    };
+
     // Phase 2c: Batch validation - collect ALL errors before registration
     let validation_errors = validate_round_register_inputs(args);
     if !validation_errors.is_empty() {
@@ -2419,9 +2515,17 @@ pub fn handle_round_register(state: &ProjectState, args: &Value) -> Result<Value
     let _dialogue = get_dialogue(conn, dialogue_id)
         .map_err(|e| ServerError::CommandFailed(format!("Dialogue not found: {}", e)))?;
 
-    // Create round record (title, then score)
-    create_round(conn, dialogue_id, round, summary, score)
-        .map_err(|e| ServerError::CommandFailed(format!("Failed to create round: {}", e)))?;
+    // Create round record with RFC 0057 metrics
+    create_round_with_metrics(
+        conn,
+        dialogue_id,
+        round,
+        summary,
+        score,
+        score_components.as_ref(),
+        convergence_metrics.as_ref(),
+    )
+    .map_err(|e| ServerError::CommandFailed(format!("Failed to create round: {}", e)))?;
 
     let mut registered = json!({
         "perspectives": [],
@@ -2700,11 +2804,52 @@ pub fn handle_verdict_register(state: &ProjectState, args: &Value) -> Result<Val
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
 
+    // RFC 0057: Force flag allows convergence without meeting criteria (with warning)
+    let force = coerce_bool(args.get("force").unwrap_or(&Value::Bool(false))).unwrap_or(false);
+
     let conn = state.store.conn();
 
     // Verify dialogue exists
     let _dialogue = get_dialogue(conn, dialogue_id)
         .map_err(|e| ServerError::CommandFailed(format!("Dialogue not found: {}", e)))?;
+
+    // RFC 0057: Convergence validation for final verdicts
+    let mut forced_warning: Option<String> = None;
+    if verdict_type == VerdictType::Final {
+        let (can_converge, blockers) = can_dialogue_converge(conn, dialogue_id)
+            .map_err(|e| ServerError::CommandFailed(format!("Failed to check convergence: {}", e)))?;
+
+        if !can_converge {
+            if force {
+                // Allow with warning
+                forced_warning = Some(format!(
+                    "FORCED CONVERGENCE: Convergence criteria not met. Blockers: {}",
+                    blockers.join("; ")
+                ));
+            } else {
+                // Block registration with structured error
+                let scoreboard = get_scoreboard(conn, dialogue_id).ok();
+                let last_round = scoreboard.as_ref().and_then(|s| s.last());
+
+                return Ok(json!({
+                    "status": "error",
+                    "error_type": "convergence_blocked",
+                    "message": format!("Cannot register final verdict: convergence criteria not met"),
+                    "blockers": blockers,
+                    "current_state": {
+                        "velocity": last_round.map(|r| r.velocity).unwrap_or(-1),
+                        "open_tensions": last_round.map(|r| r.open_tensions).unwrap_or(0),
+                        "new_perspectives": last_round.map(|r| r.new_perspectives).unwrap_or(0),
+                        "converge_percent": last_round.map(|r| r.converge_percent).unwrap_or(0.0),
+                        "converge_signals": last_round.map(|r| r.converge_signals).unwrap_or(0),
+                        "panel_size": last_round.map(|r| r.panel_size).unwrap_or(0),
+                    },
+                    "suggestion": "Either resolve remaining tensions/perspectives and get 100% expert convergence, or use force=true to override (not recommended).",
+                    "hint": "Use blue_dialogue_round_context to see detailed convergence status"
+                }));
+            }
+        }
+    }
 
     let verdict = Verdict {
         dialogue_id: dialogue_id.to_string(),
@@ -2730,14 +2875,22 @@ pub fn handle_verdict_register(state: &ProjectState, args: &Value) -> Result<Val
     register_verdict(conn, &verdict)
         .map_err(|e| ServerError::CommandFailed(format!("Failed to register verdict: {}", e)))?;
 
-    Ok(json!({
+    // RFC 0057: Include warning if convergence was forced
+    let mut response = json!({
         "status": "success",
         "message": format!("Registered {} verdict '{}' for dialogue '{}'", verdict_type.as_str(), verdict_id, dialogue_id),
         "dialogue_id": dialogue_id,
         "verdict_id": verdict_id,
         "verdict_type": verdict_type.as_str(),
         "round": round,
-    }))
+    });
+
+    if let Some(warning) = forced_warning {
+        response["warning"] = json!(warning);
+        response["forced"] = json!(true);
+    }
+
+    Ok(response)
 }
 
 /// Handle blue_dialogue_export (RFC 0051)
@@ -2778,6 +2931,10 @@ pub fn handle_export(state: &ProjectState, args: &Value) -> Result<Value, Server
 
     let verdicts = get_verdicts(conn, dialogue_id)
         .map_err(|e| ServerError::CommandFailed(format!("Failed to get verdicts: {}", e)))?;
+
+    // RFC 0057: Get scoreboard with full metrics
+    let scoreboard = get_scoreboard(conn, dialogue_id)
+        .map_err(|e| ServerError::CommandFailed(format!("Failed to get scoreboard: {}", e)))?;
 
     // Build export structure
     let export_data = json!({
@@ -2882,6 +3039,30 @@ pub fn handle_export(state: &ProjectState, args: &Value) -> Result<Value, Server
             "key_claims": v.key_claims,
             "supporting_experts": v.supporting_experts,
             "created_at": v.created_at.to_rfc3339(),
+        })).collect::<Vec<_>>(),
+        // RFC 0057: Full scoreboard with velocity and convergence tracking
+        "scoreboard": scoreboard.iter().map(|r| json!({
+            "round": r.round,
+            "score": {
+                "W": r.w,
+                "C": r.c,
+                "T": r.t,
+                "R": r.r,
+                "total": r.total,
+            },
+            "velocity": r.velocity,
+            "open_tensions": r.open_tensions,
+            "new_perspectives": r.new_perspectives,
+            "converge_signals": r.converge_signals,
+            "panel_size": r.panel_size,
+            "converge_percent": r.converge_percent,
+            "cumulative": {
+                "score": r.cumulative_score,
+                "W": r.cumulative_w,
+                "C": r.cumulative_c,
+                "T": r.cumulative_t,
+                "R": r.cumulative_r,
+            },
         })).collect::<Vec<_>>(),
         "exported_at": chrono::Utc::now().to_rfc3339(),
     });
@@ -3170,9 +3351,11 @@ mod tests {
         // Must have output_dir
         assert_eq!(protocol["output_dir"], "/tmp/blue-dialogue/system-design");
 
-        // Must have convergence params
-        assert_eq!(protocol["convergence"]["max_rounds"], 5);
+        // Must have convergence params (RFC 0057)
+        assert_eq!(protocol["convergence"]["max_rounds"], 10);
         assert!(protocol["convergence"]["tension_resolution_gate"].as_bool().unwrap());
+        assert!(protocol["convergence"]["velocity_formula"].as_str().is_some());
+        assert!(protocol["convergence"]["convergence_formula"].as_str().is_some());
     }
 
     #[test]

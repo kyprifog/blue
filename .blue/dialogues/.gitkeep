@@ -1,0 +1,7 @@
+# Blue Dialogues
+
+This directory stores alignment dialogue artifacts.
+
+Naming convention: `YYYY-MM-DDTHHMMZ-<topic>/`
+
+Example: `2026-02-03T1423Z-nvidia-investment/`

@@ -1048,7 +1048,49 @@ pub fn get_experts(
     Ok(experts)
 }
 
-/// Create a new round
+/// RFC 0057: Score components for ALIGNMENT breakdown
+#[derive(Debug, Clone, Default)]
+pub struct ScoreComponents {
+    pub wisdom: i32,
+    pub consistency: i32,
+    pub truth: i32,
+    pub relationships: i32,
+}
+
+impl ScoreComponents {
+    pub fn total(&self) -> i32 {
+        self.wisdom + self.consistency + self.truth + self.relationships
+    }
+}
+
+/// RFC 0057: Convergence metrics for a round
+#[derive(Debug, Clone, Default)]
+pub struct ConvergenceMetrics {
+    pub open_tensions: i32,
+    pub new_perspectives: i32,
+    pub converge_signals: i32,
+    pub panel_size: i32,
+}
+
+impl ConvergenceMetrics {
+    pub fn velocity(&self) -> i32 {
+        self.open_tensions + self.new_perspectives
+    }
+
+    pub fn converge_percent(&self) -> f64 {
+        if self.panel_size > 0 {
+            (self.converge_signals as f64 * 100.0) / self.panel_size as f64
+        } else {
+            0.0
+        }
+    }
+
+    pub fn can_converge(&self) -> bool {
+        self.velocity() == 0 && self.converge_percent() >= 100.0
+    }
+}
+
+/// Create a new round (legacy signature for backward compatibility)
 pub fn create_round(
     conn: &Connection,
     dialogue_id: &str,
@@ -1056,13 +1098,43 @@ pub fn create_round(
     title: Option<&str>,
     score: i32,
 ) -> Result<(), AlignmentDbError> {
+    create_round_with_metrics(
+        conn,
+        dialogue_id,
+        round,
+        title,
+        score,
+        None,
+        None,
+    )
+}
+
+/// RFC 0057: Create a new round with full metrics
+pub fn create_round_with_metrics(
+    conn: &Connection,
+    dialogue_id: &str,
+    round: i32,
+    title: Option<&str>,
+    score: i32,
+    score_components: Option<&ScoreComponents>,
+    convergence: Option<&ConvergenceMetrics>,
+) -> Result<(), AlignmentDbError> {
     let now = Utc::now().to_rfc3339();
+
+    let sc = score_components.cloned().unwrap_or_default();
+    let cm = convergence.cloned().unwrap_or_default();
 
     conn.execute(
         "INSERT INTO alignment_rounds
-         (dialogue_id, round, title, score, status, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![dialogue_id, round, title, score, "open", now],
+         (dialogue_id, round, title, score, score_wisdom, score_consistency, score_truth, score_relationships,
+          open_tensions, new_perspectives, converge_signals, panel_size, status, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![
+            dialogue_id, round, title, score,
+            sc.wisdom, sc.consistency, sc.truth, sc.relationships,
+            cm.open_tensions, cm.new_perspectives, cm.converge_signals, cm.panel_size,
+            "open", now
+        ],
     )?;
 
     // Update dialogue total rounds
@@ -1073,6 +1145,134 @@ pub fn create_round(
     )?;
 
     Ok(())
+}
+
+/// RFC 0057: Record a convergence signal from an expert
+pub fn record_convergence_signal(
+    conn: &Connection,
+    dialogue_id: &str,
+    round: i32,
+    expert_name: &str,
+) -> Result<(), AlignmentDbError> {
+    let now = Utc::now().to_rfc3339();
+
+    conn.execute(
+        "INSERT OR REPLACE INTO alignment_convergence_signals
+         (dialogue_id, round, expert_name, signaled_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![dialogue_id, round, expert_name, now],
+    )?;
+
+    Ok(())
+}
+
+/// RFC 0057: Get convergence signals for a round
+pub fn get_convergence_signals(
+    conn: &Connection,
+    dialogue_id: &str,
+    round: i32,
+) -> Result<Vec<String>, AlignmentDbError> {
+    let mut stmt = conn.prepare(
+        "SELECT expert_name FROM alignment_convergence_signals
+         WHERE dialogue_id = ?1 AND round = ?2"
+    )?;
+
+    let signals = stmt
+        .query_map(params![dialogue_id, round], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+
+    Ok(signals)
+}
+
+/// RFC 0057: Get scoreboard data for a dialogue
+pub fn get_scoreboard(
+    conn: &Connection,
+    dialogue_id: &str,
+) -> Result<Vec<ScoreboardRow>, AlignmentDbError> {
+    let mut stmt = conn.prepare(
+        "SELECT round, W, C, T, R, total, open_tensions, new_perspectives, velocity,
+                converge_signals, panel_size, converge_percent,
+                cumulative_score, cumulative_W, cumulative_C, cumulative_T, cumulative_R
+         FROM alignment_scoreboard WHERE dialogue_id = ?1 ORDER BY round"
+    )?;
+
+    let rows = stmt
+        .query_map(params![dialogue_id], |row| {
+            Ok(ScoreboardRow {
+                round: row.get(0)?,
+                w: row.get(1)?,
+                c: row.get(2)?,
+                t: row.get(3)?,
+                r: row.get(4)?,
+                total: row.get(5)?,
+                open_tensions: row.get(6)?,
+                new_perspectives: row.get(7)?,
+                velocity: row.get(8)?,
+                converge_signals: row.get(9)?,
+                panel_size: row.get(10)?,
+                converge_percent: row.get(11)?,
+                cumulative_score: row.get(12)?,
+                cumulative_w: row.get(13)?,
+                cumulative_c: row.get(14)?,
+                cumulative_t: row.get(15)?,
+                cumulative_r: row.get(16)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(rows)
+}
+
+/// RFC 0057: Scoreboard row data
+#[derive(Debug, Clone)]
+pub struct ScoreboardRow {
+    pub round: i32,
+    pub w: i32,
+    pub c: i32,
+    pub t: i32,
+    pub r: i32,
+    pub total: i32,
+    pub open_tensions: i32,
+    pub new_perspectives: i32,
+    pub velocity: i32,
+    pub converge_signals: i32,
+    pub panel_size: i32,
+    pub converge_percent: f64,
+    pub cumulative_score: i32,
+    pub cumulative_w: i32,
+    pub cumulative_c: i32,
+    pub cumulative_t: i32,
+    pub cumulative_r: i32,
+}
+
+/// RFC 0057: Check if dialogue can converge
+pub fn can_dialogue_converge(
+    conn: &Connection,
+    dialogue_id: &str,
+) -> Result<(bool, Vec<String>), AlignmentDbError> {
+    let scoreboard = get_scoreboard(conn, dialogue_id)?;
+
+    if let Some(last_round) = scoreboard.last() {
+        let mut blockers = Vec::new();
+
+        if last_round.velocity > 0 {
+            blockers.push(format!(
+                "velocity={} (open_tensions={}, new_perspectives={})",
+                last_round.velocity, last_round.open_tensions, last_round.new_perspectives
+            ));
+        }
+
+        if last_round.converge_percent < 100.0 {
+            blockers.push(format!(
+                "converge_percent={:.0}% ({}/{})",
+                last_round.converge_percent, last_round.converge_signals, last_round.panel_size
+            ));
+        }
+
+        Ok((blockers.is_empty(), blockers))
+    } else {
+        Ok((false, vec!["no rounds registered".to_string()]))
+    }
 }
 
 /// Get next sequence number for an entity type in a round
@@ -2226,11 +2426,30 @@ mod tests {
                 round INTEGER NOT NULL,
                 title TEXT,
                 score INTEGER NOT NULL,
+                -- RFC 0057: ALIGNMENT score components
+                score_wisdom INTEGER NOT NULL DEFAULT 0,
+                score_consistency INTEGER NOT NULL DEFAULT 0,
+                score_truth INTEGER NOT NULL DEFAULT 0,
+                score_relationships INTEGER NOT NULL DEFAULT 0,
+                -- RFC 0057: Velocity & convergence tracking
+                open_tensions INTEGER NOT NULL DEFAULT 0,
+                new_perspectives INTEGER NOT NULL DEFAULT 0,
+                converge_signals INTEGER NOT NULL DEFAULT 0,
+                panel_size INTEGER NOT NULL DEFAULT 0,
                 summary TEXT,
                 status TEXT NOT NULL DEFAULT 'open',
                 created_at TEXT NOT NULL,
                 completed_at TEXT,
                 PRIMARY KEY (dialogue_id, round)
+            );
+
+            -- RFC 0057: Track per-expert convergence signals
+            CREATE TABLE alignment_convergence_signals (
+                dialogue_id TEXT NOT NULL,
+                round INTEGER NOT NULL,
+                expert_name TEXT NOT NULL,
+                signaled_at TEXT NOT NULL,
+                PRIMARY KEY (dialogue_id, round, expert_name)
             );
 
             CREATE TABLE alignment_perspectives (
@@ -2382,6 +2601,31 @@ mod tests {
             CREATE INDEX idx_refs_dialogue ON alignment_refs(dialogue_id);
             CREATE INDEX idx_refs_target ON alignment_refs(dialogue_id, target_id);
             CREATE INDEX idx_verdicts_dialogue ON alignment_verdicts(dialogue_id);
+            CREATE INDEX idx_convergence_signals_round ON alignment_convergence_signals(dialogue_id, round);
+
+            -- RFC 0057: Scoreboard view for efficient convergence queries
+            CREATE VIEW alignment_scoreboard AS
+            SELECT
+                r.dialogue_id,
+                r.round,
+                r.score_wisdom AS W,
+                r.score_consistency AS C,
+                r.score_truth AS T,
+                r.score_relationships AS R,
+                r.score AS total,
+                r.open_tensions,
+                r.new_perspectives,
+                (r.open_tensions + r.new_perspectives) AS velocity,
+                r.converge_signals,
+                r.panel_size,
+                CASE WHEN r.panel_size > 0 THEN (r.converge_signals * 100.0 / r.panel_size) ELSE 0 END AS converge_percent,
+                (SELECT SUM(score) FROM alignment_rounds r2 WHERE r2.dialogue_id = r.dialogue_id AND r2.round <= r.round) AS cumulative_score,
+                (SELECT SUM(score_wisdom) FROM alignment_rounds r2 WHERE r2.dialogue_id = r.dialogue_id AND r2.round <= r.round) AS cumulative_W,
+                (SELECT SUM(score_consistency) FROM alignment_rounds r2 WHERE r2.dialogue_id = r.dialogue_id AND r2.round <= r.round) AS cumulative_C,
+                (SELECT SUM(score_truth) FROM alignment_rounds r2 WHERE r2.dialogue_id = r.dialogue_id AND r2.round <= r.round) AS cumulative_T,
+                (SELECT SUM(score_relationships) FROM alignment_rounds r2 WHERE r2.dialogue_id = r.dialogue_id AND r2.round <= r.round) AS cumulative_R
+            FROM alignment_rounds r
+            ORDER BY r.dialogue_id, r.round;
             "#,
         )
         .unwrap();
@@ -3660,5 +3904,227 @@ mod tests {
         ).unwrap();
         assert_eq!(ref_row.0, p1);
         assert_eq!(ref_row.1, t1);
+    }
+
+    // ==================== RFC 0057 Tests ====================
+
+    #[test]
+    fn test_score_components() {
+        let sc = ScoreComponents {
+            wisdom: 10,
+            consistency: 5,
+            truth: 8,
+            relationships: 3,
+        };
+        assert_eq!(sc.total(), 26);
+
+        let empty = ScoreComponents::default();
+        assert_eq!(empty.total(), 0);
+    }
+
+    #[test]
+    fn test_convergence_metrics() {
+        // Can converge: velocity=0, 100% signals
+        let cm = ConvergenceMetrics {
+            open_tensions: 0,
+            new_perspectives: 0,
+            converge_signals: 12,
+            panel_size: 12,
+        };
+        assert_eq!(cm.velocity(), 0);
+        assert_eq!(cm.converge_percent(), 100.0);
+        assert!(cm.can_converge());
+
+        // Cannot converge: velocity > 0
+        let cm2 = ConvergenceMetrics {
+            open_tensions: 2,
+            new_perspectives: 1,
+            converge_signals: 12,
+            panel_size: 12,
+        };
+        assert_eq!(cm2.velocity(), 3);
+        assert!(!cm2.can_converge());
+
+        // Cannot converge: not 100% signals
+        let cm3 = ConvergenceMetrics {
+            open_tensions: 0,
+            new_perspectives: 0,
+            converge_signals: 10,
+            panel_size: 12,
+        };
+        assert_eq!(cm3.velocity(), 0);
+        assert!(cm3.converge_percent() < 100.0);
+        assert!(!cm3.can_converge());
+
+        // Edge case: panel_size = 0
+        let cm4 = ConvergenceMetrics {
+            open_tensions: 0,
+            new_perspectives: 0,
+            converge_signals: 0,
+            panel_size: 0,
+        };
+        assert_eq!(cm4.converge_percent(), 0.0);
+        assert!(!cm4.can_converge());
+    }
+
+    #[test]
+    fn test_create_round_with_metrics() {
+        let conn = setup_test_db();
+        let dialogue_id = create_dialogue(&conn, "Metrics Test", None, None, None).unwrap();
+
+        let sc = ScoreComponents {
+            wisdom: 5,
+            consistency: 3,
+            truth: 4,
+            relationships: 2,
+        };
+        let cm = ConvergenceMetrics {
+            open_tensions: 3,
+            new_perspectives: 2,
+            converge_signals: 8,
+            panel_size: 12,
+        };
+
+        create_round_with_metrics(
+            &conn,
+            &dialogue_id,
+            0,
+            Some("Round 0"),
+            14, // 5+3+4+2
+            Some(&sc),
+            Some(&cm),
+        ).unwrap();
+
+        // Verify the round was created with correct metrics
+        let row: (i32, i32, i32, i32, i32, i32, i32, i32) = conn.query_row(
+            "SELECT score_wisdom, score_consistency, score_truth, score_relationships,
+                    open_tensions, new_perspectives, converge_signals, panel_size
+             FROM alignment_rounds WHERE dialogue_id = ?1 AND round = 0",
+            params![dialogue_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                      row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?))
+        ).unwrap();
+
+        assert_eq!(row.0, 5);  // wisdom
+        assert_eq!(row.1, 3);  // consistency
+        assert_eq!(row.2, 4);  // truth
+        assert_eq!(row.3, 2);  // relationships
+        assert_eq!(row.4, 3);  // open_tensions
+        assert_eq!(row.5, 2);  // new_perspectives
+        assert_eq!(row.6, 8);  // converge_signals
+        assert_eq!(row.7, 12); // panel_size
+    }
+
+    #[test]
+    fn test_convergence_signals() {
+        let conn = setup_test_db();
+        let dialogue_id = create_dialogue(&conn, "Signals Test", None, None, None).unwrap();
+        create_round(&conn, &dialogue_id, 0, None, 10).unwrap();
+
+        // Record signals from multiple experts
+        record_convergence_signal(&conn, &dialogue_id, 0, "muffin").unwrap();
+        record_convergence_signal(&conn, &dialogue_id, 0, "cupcake").unwrap();
+        record_convergence_signal(&conn, &dialogue_id, 0, "scone").unwrap();
+
+        // Retrieve signals
+        let signals = get_convergence_signals(&conn, &dialogue_id, 0).unwrap();
+        assert_eq!(signals.len(), 3);
+        assert!(signals.contains(&"muffin".to_string()));
+        assert!(signals.contains(&"cupcake".to_string()));
+        assert!(signals.contains(&"scone".to_string()));
+
+        // Re-recording same signal should replace (OR REPLACE)
+        record_convergence_signal(&conn, &dialogue_id, 0, "muffin").unwrap();
+        let signals2 = get_convergence_signals(&conn, &dialogue_id, 0).unwrap();
+        assert_eq!(signals2.len(), 3); // Still 3, not 4
+    }
+
+    #[test]
+    fn test_get_scoreboard() {
+        let conn = setup_test_db();
+        let dialogue_id = create_dialogue(&conn, "Scoreboard Test", None, None, None).unwrap();
+
+        // Create round 0
+        let sc0 = ScoreComponents { wisdom: 10, consistency: 5, truth: 8, relationships: 3 };
+        let cm0 = ConvergenceMetrics {
+            open_tensions: 5,
+            new_perspectives: 3,
+            converge_signals: 4,
+            panel_size: 12,
+        };
+        create_round_with_metrics(&conn, &dialogue_id, 0, Some("Round 0"), 26, Some(&sc0), Some(&cm0)).unwrap();
+
+        // Create round 1
+        let sc1 = ScoreComponents { wisdom: 8, consistency: 6, truth: 4, relationships: 2 };
+        let cm1 = ConvergenceMetrics {
+            open_tensions: 2,
+            new_perspectives: 1,
+            converge_signals: 10,
+            panel_size: 12,
+        };
+        create_round_with_metrics(&conn, &dialogue_id, 1, Some("Round 1"), 20, Some(&sc1), Some(&cm1)).unwrap();
+
+        // Get scoreboard
+        let scoreboard = get_scoreboard(&conn, &dialogue_id).unwrap();
+        assert_eq!(scoreboard.len(), 2);
+
+        // Round 0
+        let r0 = &scoreboard[0];
+        assert_eq!(r0.round, 0);
+        assert_eq!(r0.w, 10);
+        assert_eq!(r0.c, 5);
+        assert_eq!(r0.t, 8);
+        assert_eq!(r0.r, 3);
+        assert_eq!(r0.total, 26);
+        assert_eq!(r0.velocity, 8);  // 5 + 3
+        assert_eq!(r0.cumulative_score, 26);
+
+        // Round 1
+        let r1 = &scoreboard[1];
+        assert_eq!(r1.round, 1);
+        assert_eq!(r1.w, 8);
+        assert_eq!(r1.velocity, 3);  // 2 + 1
+        assert_eq!(r1.cumulative_score, 46);  // 26 + 20
+        assert_eq!(r1.cumulative_w, 18);  // 10 + 8
+    }
+
+    #[test]
+    fn test_can_dialogue_converge() {
+        let conn = setup_test_db();
+        let dialogue_id = create_dialogue(&conn, "Converge Test", None, None, None).unwrap();
+
+        // No rounds yet
+        let (can, blockers) = can_dialogue_converge(&conn, &dialogue_id).unwrap();
+        assert!(!can);
+        assert!(blockers.iter().any(|b| b.contains("no rounds")));
+
+        // Round with velocity > 0 and incomplete signals
+        let sc = ScoreComponents { wisdom: 5, consistency: 3, truth: 4, relationships: 2 };
+        let cm = ConvergenceMetrics {
+            open_tensions: 2,
+            new_perspectives: 1,
+            converge_signals: 8,
+            panel_size: 12,
+        };
+        create_round_with_metrics(&conn, &dialogue_id, 0, None, 14, Some(&sc), Some(&cm)).unwrap();
+
+        let (can, blockers) = can_dialogue_converge(&conn, &dialogue_id).unwrap();
+        assert!(!can);
+        assert!(blockers.iter().any(|b| b.contains("velocity=3")));
+        assert!(blockers.iter().any(|b| b.contains("converge_percent=")));
+
+        // Round where convergence is possible
+        let sc2 = ScoreComponents { wisdom: 2, consistency: 1, truth: 1, relationships: 1 };
+        let cm2 = ConvergenceMetrics {
+            open_tensions: 0,
+            new_perspectives: 0,
+            converge_signals: 12,
+            panel_size: 12,
+        };
+        create_round_with_metrics(&conn, &dialogue_id, 1, None, 5, Some(&sc2), Some(&cm2)).unwrap();
+
+        let (can, blockers) = can_dialogue_converge(&conn, &dialogue_id).unwrap();
+        assert!(can);
+        assert!(blockers.is_empty());
     }
 }
