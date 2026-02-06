@@ -1,144 +1,151 @@
 # Installing Blue
 
-## Quick Install
+## Quick Install (Recommended)
 
 ```bash
-./install.sh
-```
+# Build and install Blue (handles code signing correctly)
+cargo install --path apps/blue-cli
 
-This builds and installs both:
-- **Blue CLI** to `/usr/local/bin/blue`
-- **Blue MCP** configured for Claude Code
+# Configure for Claude Code
+blue install
+```
 
 Restart Claude Code after installation.
 
+## Alternative: Build Then Install
+
+If you prefer to build separately:
+
+```bash
+# Build Blue
+cargo build --release
+
+# Install for Claude Code (from build directory)
+./target/release/blue install
+```
+
+Note: Running from `target/release/` works but the binary path may change after `cargo clean`. For a persistent installation, use `cargo install` above.
+
 ## What Gets Installed
 
-### CLI
+`blue install` configures everything for Claude Code:
 
-The `blue` command becomes available system-wide:
+| Component | Location | Purpose |
+|-----------|----------|---------|
+| **Hooks** | `.claude/hooks/` | Session lifecycle, write guards |
+| **Settings** | `.claude/settings.json` | Project configuration |
+| **Skills** | `~/.claude/skills/` | Alignment dialogues |
+| **MCP Server** | `~/.claude.json` | Blue tools for Claude |
 
-```bash
-blue --version          # Check installation
-blue realm status       # Realm commands
-blue session start      # Session management
-blue daemon start       # Background service
-```
+### Hooks
 
-### MCP Server
+- `session-start.sh` — Injects Blue context at session start
+- `guard-write.sh` — Validates file writes (RFC 0038)
 
-Claude Code configuration is created/updated at `~/.config/claude-code/mcp.json`:
+### Skills
 
-```json
-{
-  "mcpServers": {
-    "blue": {
-      "command": "blue",
-      "args": ["mcp"]
-    }
-  }
-}
-```
+- `alignment-play` — Run multi-expert alignment dialogues
+- `alignment-expert` — Marker syntax for expert agents
 
-After restart, Claude has access to 8 realm tools:
-- `realm_status`, `realm_check`, `contract_get`
-- `session_start`, `session_stop`
-- `realm_worktree_create`, `realm_pr_status`
-- `notifications_list`
+### MCP Tools
 
-## Manual Install
+After restart, Claude has access to Blue tools:
+- `blue_status`, `blue_next` — Project state
+- `blue_rfc_*` — RFC management
+- `blue_worktree_*` — Git worktree coordination
+- `blue_pr_create` — Pull request creation
+- `blue_dialogue_*` — Alignment dialogues
 
-### Build
+## System-Wide Install
+
+To make `blue` available everywhere:
 
 ```bash
+# Recommended: cargo install handles signing correctly
+cargo install --path apps/blue-cli
+
+# The binary is installed to ~/.cargo/bin/blue
+# Ensure ~/.cargo/bin is in your PATH
+```
+
+### Manual Copy (Not Recommended on macOS)
+
+If you must copy the binary manually on macOS, you need to fix the code signature:
+
+```bash
+# Build
 cargo build --release
-```
 
-### Install CLI
-
-```bash
-# Standard location
+# Copy and fix signature
 sudo cp target/release/blue /usr/local/bin/
-
-# Or custom location
-cp target/release/blue ~/bin/
+sudo xattr -cr /usr/local/bin/blue
+sudo codesign --force --sign - /usr/local/bin/blue
 ```
 
-### Configure MCP
-
-Create `~/.config/claude-code/mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "blue": {
-      "command": "blue",
-      "args": ["mcp"]
-    }
-  }
-}
-```
-
-If blue isn't in PATH, use the full path:
-
-```json
-{
-  "mcpServers": {
-    "blue": {
-      "command": "/path/to/blue",
-      "args": ["mcp"]
-    }
-  }
-}
-```
-
-## Custom Install Location
-
-```bash
-INSTALL_DIR=~/bin ./install.sh
-```
+Without the signature fix, the binary may hang at startup (see RFC 0060).
 
 ## Uninstall
 
 ```bash
-# Remove CLI
-sudo rm /usr/local/bin/blue
+blue uninstall
+```
 
-# Remove MCP config (or edit to remove blue entry)
-rm ~/.config/claude-code/mcp.json
+Or manually:
+
+```bash
+# Remove hooks
+rm -rf .claude/hooks/
+
+# Remove MCP config
+# Edit ~/.claude.json and remove "blue" entry
+
+# Remove skills
+rm ~/.claude/skills/alignment-play
+rm ~/.claude/skills/alignment-expert
+
+# Remove binary (if using cargo install)
+cargo uninstall blue
 
 # Remove Blue data (optional)
-rm -rf ~/.blue
+rm -rf .blue/
 ```
 
 ## Requirements
 
 - Rust toolchain (cargo)
 - macOS, Linux, or Windows with WSL
-- Claude Code (for MCP features)
+- Claude Code
 
 ## Verify Installation
 
 ```bash
-# CLI
-blue --version
+# Check installation health
+blue doctor
+```
 
-# MCP (in Claude Code)
-Human: What realm tools do you have?
-Claude: I have realm_status, realm_check, contract_get...
+Or in Claude Code:
+```
+Human: blue status
+Claude: [calls blue_status] Project: blue, Branch: develop...
 ```
 
 ## Troubleshooting
 
 **"command not found: blue"**
-- Ensure `/usr/local/bin` is in your PATH
-- Or use `INSTALL_DIR=~/bin ./install.sh` and add `~/bin` to PATH
+- Use `cargo install --path apps/blue-cli` (adds to ~/.cargo/bin)
+- Or run from the project directory: `./target/release/blue install`
+- Ensure `~/.cargo/bin` is in your PATH
+
+**Binary hangs on macOS (no output)**
+- This is a code signature issue (RFC 0060)
+- Fix: `xattr -cr $(which blue) && codesign --force --sign - $(which blue)`
+- Or reinstall with: `cargo install --path apps/blue-cli --force`
 
 **MCP tools not appearing in Claude**
 - Restart Claude Code after installation
-- Check `~/.config/claude-code/mcp.json` syntax
+- Run `blue doctor` to check configuration
 - Verify `blue mcp` runs without errors
 
-**Permission denied**
-- The installer uses sudo for `/usr/local/bin`
-- Or install to a user directory: `INSTALL_DIR=~/bin ./install.sh`
+**Hooks not firing**
+- Check `.claude/hooks/` exists with executable scripts
+- Run `blue install --force` to regenerate hooks

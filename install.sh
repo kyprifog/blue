@@ -30,13 +30,49 @@ else
     sudo cp "$BINARY" "$INSTALL_DIR/blue"
 fi
 
-# Verify installation
-if command -v blue &> /dev/null; then
-    echo -e "${GREEN}Installed successfully${NC}"
-    echo ""
-    blue --version 2>/dev/null || blue help 2>/dev/null | head -1 || echo "blue installed to $INSTALL_DIR/blue"
+# RFC 0060: Fix macOS code signature after copy
+# cp preserves stale xattrs and adhoc signatures, causing dyld hangs
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    echo "Fixing macOS code signature..."
+    if [ -w "$INSTALL_DIR/blue" ]; then
+        xattr -cr "$INSTALL_DIR/blue" 2>/dev/null || true
+        codesign --force --sign - "$INSTALL_DIR/blue" 2>/dev/null || true
+    else
+        sudo xattr -cr "$INSTALL_DIR/blue" 2>/dev/null || true
+        sudo codesign --force --sign - "$INSTALL_DIR/blue" 2>/dev/null || true
+    fi
+fi
+
+# Verify installation with timeout (RFC 0060)
+# A hanging binary won't respond in 3 seconds
+# Note: Using perl for portable timeout (works on macOS and Linux)
+run_with_timeout() {
+    local timeout_sec=$1
+    shift
+    perl -e 'alarm shift; exec @ARGV' "$timeout_sec" "$@" 2>/dev/null
+}
+
+echo "Verifying installation..."
+BLUE_PATH="$INSTALL_DIR/blue"
+if [ -x "$BLUE_PATH" ]; then
+    if run_with_timeout 3 "$BLUE_PATH" --version >/dev/null 2>&1; then
+        echo -e "${GREEN}Installed successfully${NC}"
+        "$BLUE_PATH" --version 2>/dev/null || echo "blue installed to $BLUE_PATH"
+    else
+        echo -e "${RED}Binary installed but failed verification (possible signing issue)${NC}"
+        echo "Try: xattr -cr $BLUE_PATH && codesign --force --sign - $BLUE_PATH"
+        exit 1
+    fi
+elif command -v blue &> /dev/null; then
+    if run_with_timeout 3 blue --version >/dev/null 2>&1; then
+        echo -e "${GREEN}Installed successfully${NC}"
+        blue --version 2>/dev/null || echo "blue available in PATH"
+    else
+        echo -e "${RED}Binary in PATH but failed verification${NC}"
+        exit 1
+    fi
 else
-    echo -e "${GREEN}Installed to $INSTALL_DIR/blue${NC}"
+    echo -e "${GREEN}Installed to $BLUE_PATH${NC}"
     echo "Add $INSTALL_DIR to PATH if not already present"
 fi
 

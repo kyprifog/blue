@@ -3270,8 +3270,85 @@ async fn handle_doctor_command() -> Result<()> {
 
     // Check binary
     println!("Binary:");
-    if let Ok(path) = which::which("blue") {
+    let binary_path = which::which("blue").ok();
+    if let Some(ref path) = binary_path {
         println!("  ✓ blue found at {}", path.display());
+
+        // RFC 0060: macOS-specific signature and liveness checks
+        #[cfg(target_os = "macos")]
+        {
+            // Check for stale provenance xattr
+            let xattr_output = std::process::Command::new("xattr")
+                .arg("-l")
+                .arg(path)
+                .output();
+
+            if let Ok(output) = xattr_output {
+                let attrs = String::from_utf8_lossy(&output.stdout);
+                if attrs.contains("com.apple.provenance") {
+                    println!("  ⚠ com.apple.provenance xattr present (may cause hangs)");
+                    println!("    hint: xattr -cr {} && codesign --force --sign - {}",
+                             path.display(), path.display());
+                    issues += 1;
+                }
+            }
+
+            // Check code signature validity
+            let codesign_output = std::process::Command::new("codesign")
+                .args(["--verify", "--verbose"])
+                .arg(path)
+                .output();
+
+            if let Ok(output) = codesign_output {
+                if output.status.success() {
+                    println!("  ✓ Code signature valid");
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if stderr.contains("invalid signature") || stderr.contains("modified") {
+                        println!("  ✗ Code signature invalid or stale");
+                        println!("    hint: codesign --force --sign - {}", path.display());
+                        issues += 1;
+                    } else if stderr.contains("not signed") {
+                        println!("  - Binary not signed (may be fine)");
+                    }
+                }
+            }
+
+            // Liveness check with timeout
+            use std::time::Duration;
+            let liveness = std::process::Command::new(path)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .and_then(|mut child| {
+                    // Wait up to 3 seconds
+                    let start = std::time::Instant::now();
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(status)) => return Ok(status.success()),
+                            Ok(None) => {
+                                if start.elapsed() > Duration::from_secs(3) {
+                                    let _ = child.kill();
+                                    return Ok(false);
+                                }
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                });
+
+            match liveness {
+                Ok(true) => println!("  ✓ Binary responds within timeout"),
+                Ok(false) => {
+                    println!("  ✗ Binary hangs (dyld signature issue)");
+                    println!("    hint: cargo install --path apps/blue-cli --force");
+                    issues += 1;
+                }
+                Err(e) => println!("  ⚠ Could not run liveness check: {}", e),
+            }
+        }
     } else {
         println!("  ✗ blue not found in PATH");
         issues += 1;
