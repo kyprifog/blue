@@ -195,7 +195,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Welcome home - initialize Blue in this directory
-    Init,
+    Init {
+        /// Reinitialize even if .blue/ already exists
+        #[arg(long)]
+        force: bool,
+    },
 
     /// Get project status
     Status,
@@ -869,9 +873,38 @@ async fn tokio_main() -> Result<()> {
         None | Some(Commands::Status) => {
             println!("{}", blue_core::voice::welcome());
         }
-        Some(Commands::Init) => {
+        Some(Commands::Init { force }) => {
+            let cwd = std::env::current_dir()?;
+            let blue_dir = cwd.join(".blue");
+
+            // Check if already initialized
+            if blue_dir.exists() && !force {
+                println!("Blue already initialized in this directory.");
+                println!("  {}", blue_dir.display());
+                println!();
+                println!("Use --force to reinitialize.");
+                return Ok(());
+            }
+
+            // detect_blue auto-creates .blue/ per RFC 0003
+            let home = blue_core::detect_blue(&cwd)
+                .map_err(|e| anyhow::anyhow!("Failed to initialize: {}", e))?;
+
+            // Load state to ensure database is created with schema
+            let project = home.project_name.clone().unwrap_or_else(|| "default".to_string());
+            let _state = blue_core::ProjectState::load(home.clone(), &project)
+                .map_err(|e| anyhow::anyhow!("Failed to create database: {}", e))?;
+
             println!("{}", blue_core::voice::welcome());
-            // TODO: Initialize .blue directory
+            println!();
+            println!("Initialized Blue:");
+            println!("  Root:     {}", home.root.display());
+            println!("  Database: {}", home.db_path.display());
+            println!("  Docs:     {}", home.docs_path.display());
+            println!();
+            println!("Next steps:");
+            println!("  blue rfc create \"My First RFC\"");
+            println!("  blue status");
         }
         Some(Commands::Next) => {
             println!("Looking at what's ready. One moment.");
