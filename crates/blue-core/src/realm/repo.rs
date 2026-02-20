@@ -159,6 +159,115 @@ pub struct RealmRef {
     pub url: String,
 }
 
+/// RFC 0038: Local realm configuration stored in {repo}/.blue/realm.toml
+///
+/// This file defines cross-repo RFC dependencies and realm-specific settings.
+/// Example:
+/// ```toml
+/// [realm]
+/// name = "blue-ecosystem"
+///
+/// [rfc.0038]
+/// depends_on = ["blue-web:0015", "blue-cli:0008"]
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LocalRealmDependencies {
+    /// Realm membership (optional, for validation)
+    #[serde(default)]
+    pub realm: Option<LocalRealmMembership>,
+
+    /// RFC dependencies by RFC number/slug
+    /// Key: RFC identifier (e.g., "0038" or "sdlc-workflow-discipline")
+    /// Value: Dependency configuration
+    #[serde(default)]
+    pub rfc: std::collections::HashMap<String, RfcDependencies>,
+}
+
+/// Realm membership in realm.toml
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalRealmMembership {
+    /// Realm name
+    pub name: String,
+}
+
+/// Dependencies for a single RFC
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RfcDependencies {
+    /// Cross-repo dependencies
+    /// Format: ["repo:rfc-id", "another-repo:rfc-id"]
+    /// Example: ["blue-web:0015", "blue-cli:0008"]
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+}
+
+impl LocalRealmDependencies {
+    /// Create a new empty dependencies config
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create with realm name
+    pub fn with_realm(realm_name: impl Into<String>) -> Self {
+        Self {
+            realm: Some(LocalRealmMembership {
+                name: realm_name.into(),
+            }),
+            rfc: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Load from a TOML file
+    pub fn load(path: &Path) -> Result<Self, RealmError> {
+        let content = std::fs::read_to_string(path).map_err(|e| RealmError::ReadFile {
+            path: path.display().to_string(),
+            source: e,
+        })?;
+        let config: Self = toml::from_str(&content).map_err(|e| {
+            RealmError::ValidationFailed(format!("Invalid TOML: {}", e))
+        })?;
+        Ok(config)
+    }
+
+    /// Save to a TOML file
+    pub fn save(&self, path: &Path) -> Result<(), RealmError> {
+        let content = toml::to_string_pretty(self).map_err(|e| {
+            RealmError::ValidationFailed(format!("Failed to serialize TOML: {}", e))
+        })?;
+        std::fs::write(path, content).map_err(|e| RealmError::WriteFile {
+            path: path.display().to_string(),
+            source: e,
+        })?;
+        Ok(())
+    }
+
+    /// Get dependencies for a specific RFC
+    pub fn get_rfc_deps(&self, rfc_id: &str) -> Vec<String> {
+        self.rfc
+            .get(rfc_id)
+            .map(|d| d.depends_on.clone())
+            .unwrap_or_default()
+    }
+
+    /// Add dependencies for an RFC
+    pub fn add_rfc_deps(&mut self, rfc_id: impl Into<String>, deps: Vec<String>) {
+        self.rfc.insert(
+            rfc_id.into(),
+            RfcDependencies { depends_on: deps },
+        );
+    }
+
+    /// Check if the realm.toml exists at the given path
+    pub fn exists(base_path: &Path) -> bool {
+        base_path.join(".blue").join("realm.toml").exists()
+    }
+
+    /// Load from the standard location (.blue/realm.toml)
+    pub fn load_from_blue(base_path: &Path) -> Result<Self, RealmError> {
+        let path = base_path.join(".blue").join("realm.toml");
+        Self::load(&path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

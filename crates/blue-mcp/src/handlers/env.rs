@@ -2,6 +2,8 @@
 //!
 //! Handles detection of external dependencies and generation of
 //! isolated environment configurations for parallel agent execution.
+//!
+//! RFC 0034: Reads .blue/config.yaml for AWS profile and worktree.env settings.
 
 use std::collections::HashMap;
 use std::fs;
@@ -10,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+use blue_core::BlueConfig;
 use crate::error::ServerError;
 
 /// Detected external dependency
@@ -59,6 +62,8 @@ pub fn handle_detect(args: &Value, repo_path: &Path) -> Result<Value, ServerErro
 }
 
 /// Handle blue_env_mock
+///
+/// RFC 0034: Includes AWS profile and worktree.env from .blue/config.yaml
 pub fn handle_mock(args: &Value, repo_path: &Path) -> Result<Value, ServerError> {
     let scan_path = args
         .get("cwd")
@@ -87,8 +92,12 @@ pub fn handle_mock(args: &Value, repo_path: &Path) -> Result<Value, ServerError>
 
     let (dependencies, _, _, _, mock_config) = detect_dependencies(&scan_path);
 
+    // RFC 0034: Load config for AWS profile and worktree.env
+    let blue_dir = repo_path.join(".blue");
+    let config = BlueConfig::load(&blue_dir).ok();
+
     // Generate .env.isolated content
-    let env_content = generate_env_isolated(&agent_id, &worktree_path, &dependencies, &mock_config);
+    let env_content = generate_env_isolated(&agent_id, &worktree_path, &dependencies, &mock_config, config.as_ref());
 
     // Write file
     let env_file_path = worktree_path.join(".env.isolated");
@@ -269,22 +278,52 @@ fn set_default_mock_config(deps: &[Dependency], mock_config: &mut HashMap<String
     mock_config.entry("BLUE_ISOLATION_MODE".to_string()).or_insert("mock".to_string());
 }
 
+/// Generate .env.isolated content
+///
+/// RFC 0034: Includes AWS_PROFILE from config.aws and custom vars from config.worktree.env
 fn generate_env_isolated(
     agent_id: &str,
     worktree_path: &Path,
     dependencies: &[Dependency],
     mock_config: &HashMap<String, String>,
+    config: Option<&BlueConfig>,
 ) -> String {
     let mut lines = vec![
         "# Blue Environment Isolation".to_string(),
         "# Auto-generated - do not commit".to_string(),
         format!("# Worktree: {}", worktree_path.display()),
-        "".to_string(),
-        "# Agent Identification".to_string(),
-        format!("BLUE_AGENT_ID={}", agent_id),
-        "BLUE_ISOLATION_MODE=mock".to_string(),
-        "".to_string(),
     ];
+
+    // RFC 0034: Add source reference if config exists
+    if config.is_some() {
+        lines.push("# Source: .blue/config.yaml".to_string());
+    }
+
+    lines.push("".to_string());
+    lines.push("# Agent Identification".to_string());
+    lines.push(format!("BLUE_AGENT_ID={}", agent_id));
+    lines.push("BLUE_ISOLATION_MODE=mock".to_string());
+    lines.push("".to_string());
+
+    // RFC 0034: AWS profile from config
+    if let Some(cfg) = config {
+        if let Some(profile) = cfg.aws_profile() {
+            lines.push("# AWS Configuration (from .blue/config.yaml)".to_string());
+            lines.push(format!("AWS_PROFILE={}", profile));
+            lines.push("".to_string());
+        }
+
+        // RFC 0034: Custom worktree env vars
+        if let Some(worktree_cfg) = &cfg.worktree {
+            if !worktree_cfg.env.is_empty() {
+                lines.push("# Custom Environment (from .blue/config.yaml worktree.env)".to_string());
+                for (key, value) in &worktree_cfg.env {
+                    lines.push(format!("{}={}", key, value));
+                }
+                lines.push("".to_string());
+            }
+        }
+    }
 
     if !mock_config.is_empty() {
         lines.push("# Mock Configurations".to_string());

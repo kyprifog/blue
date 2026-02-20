@@ -701,6 +701,13 @@ fn create_git_worktree(
         return Err("Worktree path already exists".to_string());
     }
 
+    // Derive worktree name from path (directory name = slug, no slashes)
+    // Git worktree names are stored in .git/worktrees/<name> and cannot contain slashes
+    let worktree_name = worktree_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("Invalid worktree path")?;
+
     // Get HEAD commit to branch from
     let head = repo.head().map_err(|e| format!("Failed to get HEAD: {}", e))?;
     let commit = head.peel_to_commit().map_err(|e| format!("Failed to get commit: {}", e))?;
@@ -720,7 +727,7 @@ fn create_git_worktree(
 
     // Create the worktree
     repo.worktree(
-        branch_name,
+        worktree_name,
         worktree_path,
         Some(git2::WorktreeAddOptions::new().reference(Some(&reference))),
     )
@@ -1108,6 +1115,241 @@ fn fetch_pending_notifications(ctx: &RealmContext) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+// ─── Phase 5: RFC Validation (RFC 0038) ─────────────────────────────────────
+
+use blue_core::realm::LocalRealmDependencies;
+
+/// RFC dependency status for cross-repo coordination
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RfcDepStatus {
+    /// Dependency string (e.g., "blue-web:0015")
+    pub dependency: String,
+    /// Parsed repo name
+    pub repo: String,
+    /// Parsed RFC identifier
+    pub rfc_id: String,
+    /// Whether the dependency is resolved
+    pub resolved: bool,
+    /// Status of the RFC if found
+    pub status: Option<String>,
+    /// Error message if couldn't check
+    pub error: Option<String>,
+}
+
+/// Handle blue_rfc_validate_realm - validate realm RFC dependencies
+///
+/// Loads .blue/realm.toml and checks status of cross-repo RFC dependencies.
+/// Returns a status matrix showing resolved/unresolved dependencies.
+pub fn handle_validate_realm(
+    cwd: Option<&Path>,
+    strict: bool,
+) -> Result<Value, ServerError> {
+    let cwd = cwd.ok_or(ServerError::InvalidParams)?;
+
+    // Check for .blue/realm.toml
+    if !LocalRealmDependencies::exists(cwd) {
+        return Ok(json!({
+            "status": "success",
+            "message": "No .blue/realm.toml found - no cross-repo RFC dependencies defined",
+            "dependencies": [],
+            "summary": {
+                "total": 0,
+                "resolved": 0,
+                "unresolved": 0
+            },
+            "next_steps": ["Create .blue/realm.toml to define cross-repo RFC dependencies"]
+        }));
+    }
+
+    // Load realm dependencies
+    let realm_deps = LocalRealmDependencies::load_from_blue(cwd).map_err(|e| {
+        ServerError::CommandFailed(format!("Failed to load .blue/realm.toml: {}", e))
+    })?;
+
+    // Collect all dependencies across all RFCs
+    let mut all_deps: Vec<RfcDepStatus> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    for (rfc_id, deps) in &realm_deps.rfc {
+        for dep in &deps.depends_on {
+            let status = check_dependency(cwd, dep);
+            if status.error.is_some() {
+                errors.push(format!("RFC {}: {}", rfc_id, status.error.as_ref().unwrap()));
+            }
+            all_deps.push(status);
+        }
+    }
+
+    // Calculate summary
+    let total = all_deps.len();
+    let resolved = all_deps.iter().filter(|d| d.resolved).count();
+    let unresolved = total - resolved;
+
+    // Build next steps
+    let mut next_steps = Vec::new();
+    if unresolved > 0 {
+        next_steps.push(format!("{} unresolved RFC dependencies - coordinate with dependent repos", unresolved));
+
+        // List specific unresolved deps
+        for dep in all_deps.iter().filter(|d| !d.resolved) {
+            if let Some(ref status) = dep.status {
+                next_steps.push(format!("  {} is '{}' - wait for implementation", dep.dependency, status));
+            } else if let Some(ref err) = dep.error {
+                next_steps.push(format!("  {} - {}", dep.dependency, err));
+            }
+        }
+    }
+    if resolved == total && total > 0 {
+        next_steps.push("All RFC dependencies resolved - ready to proceed".to_string());
+    }
+
+    // In strict mode, return error status if any unresolved
+    let status = if strict && unresolved > 0 {
+        "error"
+    } else {
+        "success"
+    };
+
+    Ok(json!({
+        "status": status,
+        "realm": realm_deps.realm.as_ref().map(|r| &r.name),
+        "dependencies": all_deps,
+        "summary": {
+            "total": total,
+            "resolved": resolved,
+            "unresolved": unresolved
+        },
+        "errors": errors,
+        "next_steps": next_steps
+    }))
+}
+
+/// Check a single dependency status
+///
+/// Format: "repo:rfc-id" (e.g., "blue-web:0015")
+fn check_dependency(cwd: &Path, dep: &str) -> RfcDepStatus {
+    // Parse dependency format: "repo:rfc-id"
+    let parts: Vec<&str> = dep.splitn(2, ':').collect();
+    if parts.len() != 2 {
+        return RfcDepStatus {
+            dependency: dep.to_string(),
+            repo: String::new(),
+            rfc_id: String::new(),
+            resolved: false,
+            status: None,
+            error: Some(format!("Invalid dependency format '{}' - expected 'repo:rfc-id'", dep)),
+        };
+    }
+
+    let repo = parts[0].to_string();
+    let rfc_id = parts[1].to_string();
+
+    // First, try to check locally if this is the current repo
+    if let Some(local_status) = check_local_rfc(cwd, &rfc_id) {
+        let resolved = local_status == "implemented";
+        return RfcDepStatus {
+            dependency: dep.to_string(),
+            repo,
+            rfc_id,
+            resolved,
+            status: Some(local_status),
+            error: None,
+        };
+    }
+
+    // Check in realm cache for remote repos
+    if let Some(remote_status) = check_remote_rfc(&repo, &rfc_id) {
+        let resolved = remote_status == "implemented";
+        return RfcDepStatus {
+            dependency: dep.to_string(),
+            repo,
+            rfc_id,
+            resolved,
+            status: Some(remote_status),
+            error: None,
+        };
+    }
+
+    // Couldn't check - report as unresolved with error
+    RfcDepStatus {
+        dependency: dep.to_string(),
+        repo,
+        rfc_id,
+        resolved: false,
+        status: None,
+        error: Some(format!("Could not verify RFC status in repo '{}' - repo not in realm cache", parts[0])),
+    }
+}
+
+/// Check RFC status in the local repo
+fn check_local_rfc(cwd: &Path, rfc_id: &str) -> Option<String> {
+    // Try to find RFC by number or title in local .blue/docs/rfcs/
+    let rfcs_dir = cwd.join(".blue").join("docs").join("rfcs");
+    if !rfcs_dir.exists() {
+        return None;
+    }
+
+    // Look for matching RFC files
+    let pattern = format!("{}-", rfc_id);
+
+    if let Ok(entries) = std::fs::read_dir(&rfcs_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(&pattern) && name.ends_with(".md") {
+                // Parse status from filename (e.g., "0015-foo.implemented.md")
+                if name.contains(".implemented.") {
+                    return Some("implemented".to_string());
+                } else if name.contains(".accepted.") {
+                    return Some("accepted".to_string());
+                } else if name.contains(".impl.") {
+                    return Some("in-progress".to_string());
+                } else if name.contains(".draft.") {
+                    return Some("draft".to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Check RFC status in a remote repo via realm cache
+fn check_remote_rfc(repo: &str, rfc_id: &str) -> Option<String> {
+    // Check in /tmp/blue-realm-cache/<repo>/.blue/docs/rfcs/
+    let cache_dir = std::path::PathBuf::from("/tmp/blue-realm-cache")
+        .join(repo)
+        .join(".blue")
+        .join("docs")
+        .join("rfcs");
+
+    if !cache_dir.exists() {
+        return None;
+    }
+
+    // Look for matching RFC files
+    let pattern = format!("{}-", rfc_id);
+
+    if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(&pattern) && name.ends_with(".md") {
+                // Parse status from filename
+                if name.contains(".implemented.") {
+                    return Some("implemented".to_string());
+                } else if name.contains(".accepted.") {
+                    return Some("accepted".to_string());
+                } else if name.contains(".impl.") {
+                    return Some("in-progress".to_string());
+                } else if name.contains(".draft.") {
+                    return Some("draft".to_string());
+                }
+            }
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]

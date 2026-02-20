@@ -9,9 +9,36 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{debug, info};
 
-use blue_core::{detect_blue, DocType, Document, ProjectState, Rfc, RfcStatus, title_to_slug, validate_rfc_transition};
+use blue_core::{detect_blue, BlueConfig, DocType, Document, ProjectState, Rfc, RfcStatus, title_to_slug, validate_rfc_transition};
 
 use crate::error::ServerError;
+
+/// Parse | **Source Spike** | spike-title | from RFC frontmatter (RFC 0038)
+fn parse_source_spike(content: &str) -> Option<String> {
+    let pattern = regex::Regex::new(r"\| \*\*Source Spike\*\* \| ([^|]+) \|").ok()?;
+    let caps = pattern.captures(content)?;
+    Some(caps.get(1)?.as_str().trim().to_string())
+}
+
+/// Parse | **Produces RFCs** | 0038, 0039 | from spike frontmatter (RFC 0038)
+fn parse_produces_rfcs(content: &str) -> Vec<String> {
+    let pattern = regex::Regex::new(r"\| \*\*Produces RFCs\*\* \| ([^|]+) \|").ok();
+    match pattern {
+        Some(re) => {
+            if let Some(caps) = re.captures(content) {
+                if let Some(m) = caps.get(1) {
+                    return m.as_str()
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                }
+            }
+            Vec::new()
+        }
+        None => Vec::new(),
+    }
+}
 
 /// Blue MCP Server state
 pub struct BlueServer {
@@ -74,6 +101,7 @@ impl BlueServer {
     /// Try to load project state for the current directory
     ///
     /// RFC 0020 fallback chain: cwd → mcp_root → walk tree → fail with guidance
+    /// RFC 0034: Also injects AWS_PROFILE from config if configured
     fn ensure_state(&mut self) -> Result<&ProjectState, ServerError> {
         if self.state.is_none() {
             // RFC 0020: explicit cwd → MCP roots → walk tree → fail with guidance
@@ -87,6 +115,16 @@ impl BlueServer {
                     cwd.display()
                 ))
             })?;
+
+            // RFC 0034: Inject AWS_PROFILE from config (shell precedence honored)
+            if let Ok(config) = BlueConfig::load(&home.blue_dir) {
+                if let Some(profile) = config.aws_profile() {
+                    if std::env::var("AWS_PROFILE").is_err() {
+                        std::env::set_var("AWS_PROFILE", profile);
+                        info!(profile = %profile, "AWS profile set from .blue/config.yaml");
+                    }
+                }
+            }
 
             // Try to get project name from the current path
             let project = home.project_name.clone().unwrap_or_else(|| "default".to_string());
@@ -113,6 +151,16 @@ impl BlueServer {
                     cwd.display()
                 ))
             })?;
+
+            // RFC 0034: Inject AWS_PROFILE from config (shell precedence honored)
+            if let Ok(config) = BlueConfig::load(&home.blue_dir) {
+                if let Some(profile) = config.aws_profile() {
+                    if std::env::var("AWS_PROFILE").is_err() {
+                        std::env::set_var("AWS_PROFILE", profile);
+                        info!(profile = %profile, "AWS profile set from .blue/config.yaml");
+                    }
+                }
+            }
 
             // Try to get project name from the current path
             let project = home.project_name.clone().unwrap_or_else(|| "default".to_string());
@@ -1487,7 +1535,7 @@ impl BlueServer {
                 },
                 {
                     "name": "blue_dialogue_create",
-                    "description": "Create a new dialogue document. Pass alignment: true for multi-agent alignment dialogues (ADR 0014). When alignment is enabled, the response message contains a JUDGE PROTOCOL section — you MUST follow those instructions exactly to orchestrate the dialogue. The protocol tells you how to spawn background agents, score them, and run convergence rounds.",
+                    "description": "Create a new dialogue document. Pass alignment: true for multi-agent alignment dialogues (ADR 0014, RFC 0048). Alignment mode REQUIRES expert_pool parameter with tiered experts. The response contains a JUDGE PROTOCOL — follow those instructions to orchestrate the dialogue.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -1509,11 +1557,44 @@ impl BlueServer {
                             },
                             "alignment": {
                                 "type": "boolean",
-                                "description": "Enable alignment mode — returns a judge protocol with pastry-themed expert agents"
+                                "description": "Enable alignment mode — REQUIRES expert_pool parameter"
                             },
-                            "agents": {
+                            "expert_pool": {
+                                "type": "object",
+                                "description": "RFC 0048: Judge-defined expert pool (REQUIRED for alignment mode)",
+                                "properties": {
+                                    "domain": {
+                                        "type": "string",
+                                        "description": "Domain name (e.g., 'Investment Analysis')"
+                                    },
+                                    "question": {
+                                        "type": "string",
+                                        "description": "Optional: specific question being deliberated"
+                                    },
+                                    "experts": {
+                                        "type": "array",
+                                        "description": "Array of experts with role, tier, and relevance",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "role": { "type": "string", "description": "Expert role (e.g., 'Risk Manager')" },
+                                                "tier": { "type": "string", "enum": ["core", "adjacent", "wildcard"], "description": "Expert tier" },
+                                                "relevance": { "type": "number", "description": "Relevance score 0.0-1.0" }
+                                            },
+                                            "required": ["role", "tier", "relevance"]
+                                        }
+                                    }
+                                },
+                                "required": ["domain", "experts"]
+                            },
+                            "panel_size": {
                                 "type": "integer",
-                                "description": "Number of cupcake agents (alignment mode only, default 3)"
+                                "description": "Number of experts to sample per round (default: pool size or 12)"
+                            },
+                            "rotation": {
+                                "type": "string",
+                                "enum": ["none", "wildcards", "full"],
+                                "description": "Panel rotation mode: none (fixed), wildcards (rotate wildcards), full (resample all)"
                             },
                             "model": {
                                 "type": "string",
@@ -1583,6 +1664,335 @@ impl BlueServer {
                             }
                         },
                         "required": ["title"]
+                    }
+                },
+                {
+                    "name": "blue_dialogue_round_prompt",
+                    "description": "Get a fully-substituted prompt for a specific agent and round, ready to pass directly to the Task tool. Use this instead of manual template substitution. RFC 0050: Supports graduated rotation with expert_source and focus parameters.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "output_dir": {
+                                "type": "string",
+                                "description": "Output directory from blue_dialogue_create (e.g., '/tmp/blue-dialogue/my-topic')"
+                            },
+                            "agent_name": {
+                                "type": "string",
+                                "description": "Agent name (e.g., 'Muffin')"
+                            },
+                            "agent_emoji": {
+                                "type": "string",
+                                "description": "Agent emoji (e.g., '🧁')"
+                            },
+                            "agent_role": {
+                                "type": "string",
+                                "description": "Agent role (e.g., 'Platform Architect')"
+                            },
+                            "round": {
+                                "type": "integer",
+                                "description": "Round number (0 for opening arguments, 1+ for subsequent rounds)"
+                            },
+                            "sources": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Optional source files for grounding"
+                            },
+                            "expert_source": {
+                                "type": "string",
+                                "enum": ["retained", "pool", "created"],
+                                "description": "RFC 0050: How the expert joined the panel. Fresh experts (pool/created) get context briefs."
+                            },
+                            "focus": {
+                                "type": "string",
+                                "description": "RFC 0050: Optional focus area for created experts"
+                            }
+                        },
+                        "required": ["output_dir", "agent_name", "agent_emoji", "agent_role", "round"]
+                    }
+                },
+                {
+                    "name": "blue_dialogue_sample_panel",
+                    "description": "RFC 0048: Sample a new panel from the expert pool for manual round control. Use this when you want to explicitly control which experts participate in a specific round.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "dialogue_title": {
+                                "type": "string",
+                                "description": "Dialogue title (used to find the expert-pool.json)"
+                            },
+                            "round": {
+                                "type": "integer",
+                                "description": "Round number to sample for"
+                            },
+                            "panel_size": {
+                                "type": "integer",
+                                "description": "Number of experts to sample (default: 12)"
+                            },
+                            "retain": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Expert roles to retain (must include these)"
+                            },
+                            "exclude": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Expert roles to exclude"
+                            }
+                        },
+                        "required": ["dialogue_title", "round"]
+                    }
+                },
+                {
+                    "name": "blue_dialogue_evolve_panel",
+                    "description": "RFC 0050: Judge-driven panel evolution for graduated rotation. Specify exactly which experts to include, their sources (retained/pool/created), and create new experts on-demand.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "output_dir": {
+                                "type": "string",
+                                "description": "Output directory (e.g., /tmp/blue-dialogue/topic-slug)"
+                            },
+                            "round": {
+                                "type": "integer",
+                                "description": "Round number"
+                            },
+                            "panel": {
+                                "type": "array",
+                                "description": "Array of expert specifications for this round",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {
+                                            "type": "string",
+                                            "description": "Pastry name (e.g., Muffin, Scone)"
+                                        },
+                                        "role": {
+                                            "type": "string",
+                                            "description": "Expert role (e.g., Value Analyst)"
+                                        },
+                                        "source": {
+                                            "type": "string",
+                                            "enum": ["retained", "pool", "created"],
+                                            "description": "How the expert joined: retained from prior round, pulled from pool, or created on-demand"
+                                        },
+                                        "tier": {
+                                            "type": "string",
+                                            "enum": ["Core", "Adjacent", "Wildcard"],
+                                            "description": "Required for created experts"
+                                        },
+                                        "focus": {
+                                            "type": "string",
+                                            "description": "Optional focus area for the expert"
+                                        }
+                                    },
+                                    "required": ["name", "role", "source"]
+                                }
+                            }
+                        },
+                        "required": ["output_dir", "round", "panel"]
+                    }
+                },
+                // RFC 0051: Global perspective & tension tracking
+                {
+                    "name": "blue_dialogue_round_context",
+                    "description": "RFC 0051: Bulk fetch context for all panel experts in a single call. Returns structured data for prompt building.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "dialogue_id": {
+                                "type": "string",
+                                "description": "Dialogue ID (e.g., 'nvidia-investment-analysis')"
+                            },
+                            "round": {
+                                "type": "integer",
+                                "description": "Round number to get context for"
+                            }
+                        },
+                        "required": ["dialogue_id", "round"]
+                    }
+                },
+                {
+                    "name": "blue_dialogue_expert_create",
+                    "description": "RFC 0051: Create a new expert mid-dialogue to address emerging needs. The expert will be registered with source='created'.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "dialogue_id": {
+                                "type": "string",
+                                "description": "Dialogue ID"
+                            },
+                            "expert_slug": {
+                                "type": "string",
+                                "description": "Expert slug (lowercase, e.g., 'palmier')"
+                            },
+                            "role": {
+                                "type": "string",
+                                "description": "Expert role (e.g., 'Geopolitical Risk Analyst')"
+                            },
+                            "tier": {
+                                "type": "string",
+                                "enum": ["Core", "Adjacent", "Wildcard"],
+                                "description": "Expert tier"
+                            },
+                            "focus": {
+                                "type": "string",
+                                "description": "Focus area for this expert"
+                            },
+                            "creation_reason": {
+                                "type": "string",
+                                "description": "Why the Judge created this expert"
+                            },
+                            "first_round": {
+                                "type": "integer",
+                                "description": "Round when expert joins"
+                            }
+                        },
+                        "required": ["dialogue_id", "expert_slug", "role", "tier", "creation_reason", "first_round"]
+                    }
+                },
+                {
+                    "name": "blue_dialogue_round_register",
+                    "description": "RFC 0051: Bulk register all round data in a single atomic call - perspectives, recommendations, tensions, evidence, claims, scores, and refs.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "dialogue_id": {
+                                "type": "string",
+                                "description": "Dialogue ID"
+                            },
+                            "round": {
+                                "type": "integer",
+                                "description": "Round number"
+                            },
+                            "score": {
+                                "type": "integer",
+                                "description": "ALIGNMENT score for this round"
+                            },
+                            "summary": {
+                                "type": "string",
+                                "description": "Judge's synthesis of the round"
+                            },
+                            "expert_scores": {
+                                "type": "object",
+                                "description": "Map of expert_slug to score (e.g., {\"muffin\": 12, \"donut\": 15})"
+                            },
+                            "perspectives": {
+                                "type": "array",
+                                "description": "Array of perspective objects with local_id, label, content, contributors, references"
+                            },
+                            "recommendations": {
+                                "type": "array",
+                                "description": "Array of recommendation objects with local_id, label, content, contributors, parameters, references"
+                            },
+                            "tensions": {
+                                "type": "array",
+                                "description": "Array of tension objects with local_id, label, description, contributors, references"
+                            },
+                            "evidence": {
+                                "type": "array",
+                                "description": "Array of evidence objects with local_id, label, content, contributors, references"
+                            },
+                            "claims": {
+                                "type": "array",
+                                "description": "Array of claim objects with local_id, label, content, contributors, references"
+                            },
+                            "tension_updates": {
+                                "type": "array",
+                                "description": "Array of tension status updates: {id, status, by, via}"
+                            }
+                        },
+                        "required": ["dialogue_id", "round", "score"]
+                    }
+                },
+                {
+                    "name": "blue_dialogue_verdict_register",
+                    "description": "RFC 0051: Register a verdict (interim, final, minority, or dissent).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "dialogue_id": {
+                                "type": "string",
+                                "description": "Dialogue ID"
+                            },
+                            "verdict_id": {
+                                "type": "string",
+                                "description": "Verdict identifier (e.g., 'final', 'V01', 'minority-esg')"
+                            },
+                            "verdict_type": {
+                                "type": "string",
+                                "enum": ["interim", "final", "minority", "dissent"],
+                                "description": "Type of verdict"
+                            },
+                            "round": {
+                                "type": "integer",
+                                "description": "Round when verdict was issued"
+                            },
+                            "recommendation": {
+                                "type": "string",
+                                "description": "One-line decision (e.g., 'APPROVE conditional partial trim')"
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "Reasoning summary (2-3 sentences)"
+                            },
+                            "conditions": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Conditions for the verdict"
+                            },
+                            "vote": {
+                                "type": "string",
+                                "description": "Vote count (e.g., '12-0', '11-1')"
+                            },
+                            "confidence": {
+                                "type": "string",
+                                "enum": ["unanimous", "strong", "split", "contested"],
+                                "description": "Confidence level"
+                            },
+                            "tensions_resolved": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Tension IDs resolved by this verdict"
+                            },
+                            "tensions_accepted": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Tension IDs accepted (acknowledged but not blocking)"
+                            },
+                            "recommendations_adopted": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Recommendation IDs adopted"
+                            },
+                            "author_expert": {
+                                "type": "string",
+                                "description": "Expert slug if authored by expert (null = Judge)"
+                            },
+                            "supporting_experts": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Expert slugs supporting minority verdict"
+                            }
+                        },
+                        "required": ["dialogue_id", "verdict_id", "verdict_type", "round", "recommendation", "description"]
+                    }
+                },
+                {
+                    "name": "blue_dialogue_export",
+                    "description": "RFC 0051: Export dialogue to JSON with full provenance from database.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "dialogue_id": {
+                                "type": "string",
+                                "description": "Dialogue ID to export"
+                            },
+                            "output_path": {
+                                "type": "string",
+                                "description": "Path to write JSON file (optional, defaults to output_dir/dialogue.json)"
+                            }
+                        },
+                        "required": ["dialogue_id"]
                     }
                 },
                 // Phase 8: Playwright verification
@@ -1903,6 +2313,24 @@ impl BlueServer {
                             }
                         },
                         "required": ["cwd"]
+                    }
+                },
+                // RFC 0038: Realm RFC Validation
+                {
+                    "name": "blue_rfc_validate_realm",
+                    "description": "Validate cross-repo RFC dependencies defined in .blue/realm.toml. Returns status matrix showing resolved/unresolved dependencies. Use --strict to fail on unresolved deps.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cwd": {
+                                "type": "string",
+                                "description": "Current working directory"
+                            },
+                            "strict": {
+                                "type": "boolean",
+                                "description": "Fail if any dependencies are unresolved (default: false, just warn)"
+                            }
+                        }
                     }
                 },
                 // RFC 0005: Local LLM Integration
@@ -2344,6 +2772,15 @@ impl BlueServer {
             "blue_dialogue_get" => self.handle_dialogue_get(&call.arguments),
             "blue_dialogue_list" => self.handle_dialogue_list(&call.arguments),
             "blue_dialogue_save" => self.handle_dialogue_save(&call.arguments),
+            "blue_dialogue_round_prompt" => self.handle_dialogue_round_prompt(&call.arguments),
+            "blue_dialogue_sample_panel" => self.handle_dialogue_sample_panel(&call.arguments),
+            "blue_dialogue_evolve_panel" => self.handle_dialogue_evolve_panel(&call.arguments),
+            // RFC 0051: Global perspective & tension tracking
+            "blue_dialogue_round_context" => self.handle_dialogue_round_context(&call.arguments),
+            "blue_dialogue_expert_create" => self.handle_dialogue_expert_create(&call.arguments),
+            "blue_dialogue_round_register" => self.handle_dialogue_round_register(&call.arguments),
+            "blue_dialogue_verdict_register" => self.handle_dialogue_verdict_register(&call.arguments),
+            "blue_dialogue_export" => self.handle_dialogue_export(&call.arguments),
             // Phase 8: Playwright handler
             "blue_playwright_verify" => self.handle_playwright_verify(&call.arguments),
             // Phase 9: Post-mortem handlers
@@ -2363,6 +2800,8 @@ impl BlueServer {
             "blue_realm_worktree_create" => self.handle_realm_worktree_create(&call.arguments),
             "blue_realm_pr_status" => self.handle_realm_pr_status(&call.arguments),
             "blue_notifications_list" => self.handle_notifications_list(&call.arguments),
+            // RFC 0038: Realm RFC Validation
+            "blue_rfc_validate_realm" => self.handle_validate_realm(&call.arguments),
             // RFC 0005: LLM tools
             "blue_llm_start" => crate::handlers::llm::handle_start(&call.arguments.unwrap_or_default()),
             "blue_llm_stop" => crate::handlers::llm::handle_stop(),
@@ -2749,6 +3188,20 @@ impl BlueServer {
             false
         };
 
+        // RFC 0038: Auto-close source spike when RFC transitions to implemented
+        let spike_closed = if status_str == "implemented" {
+            self.try_close_source_spike(title, &doc)
+        } else {
+            None
+        };
+
+        // RFC 0038: Suggest relevant ADRs when RFC transitions to in-progress
+        let adr_suggestions = if status_str == "in-progress" {
+            self.get_adr_suggestions(title)
+        } else {
+            None
+        };
+
         // Conversational hints guide Claude to next action (RFC 0014)
         let hint = match target_status {
             RfcStatus::Accepted => Some(
@@ -2797,8 +3250,145 @@ impl BlueServer {
         if let Some(warning) = worktree_warning {
             response["warning"] = json!(warning);
         }
+        // RFC 0038: Include spike closure info
+        if let Some(spike_info) = spike_closed {
+            response["spike_closed"] = spike_info;
+        }
+        // RFC 0038: Include ADR suggestions
+        if let Some(adrs) = adr_suggestions {
+            response["adr_suggestions"] = adrs;
+        }
 
         Ok(response)
+    }
+
+    /// RFC 0038: Try to close the source spike when RFC is implemented
+    fn try_close_source_spike(&self, _rfc_title: &str, rfc_doc: &Document) -> Option<Value> {
+        let state = self.state.as_ref()?;
+
+        // Read RFC file to extract source spike
+        let rfc_file_path = rfc_doc.file_path.as_ref()?;
+        let full_path = state.home.docs_path.join(rfc_file_path);
+        let content = fs::read_to_string(&full_path).ok()?;
+
+        // Parse | **Source Spike** | spike-title | from RFC frontmatter
+        let source_spike = parse_source_spike(&content)?;
+
+        // Find the spike document
+        let spike_doc = state.store.find_document(DocType::Spike, &source_spike).ok()?;
+
+        // Check if spike has produces_rfcs field - if so, verify all are resolved
+        if let Some(spike_path) = &spike_doc.file_path {
+            let spike_full_path = state.home.docs_path.join(spike_path);
+            if let Ok(spike_content) = fs::read_to_string(&spike_full_path) {
+                let produces_rfcs = parse_produces_rfcs(&spike_content);
+
+                if !produces_rfcs.is_empty() {
+                    // Check if ALL produced RFCs are resolved (implemented or superseded)
+                    let mut all_resolved = true;
+                    let mut pending_rfcs = Vec::new();
+
+                    for rfc_ref in &produces_rfcs {
+                        // Handle cross-repo references (e.g., "blue-web:0015")
+                        let (repo, rfc_id) = if rfc_ref.contains(':') {
+                            let parts: Vec<&str> = rfc_ref.splitn(2, ':').collect();
+                            (Some(parts[0]), parts[1])
+                        } else {
+                            (None, rfc_ref.as_str())
+                        };
+
+                        // For now, only handle local RFCs
+                        if repo.is_some() {
+                            continue; // Skip cross-repo for now
+                        }
+
+                        // Find the RFC by number or title
+                        if let Ok(doc) = state.store.find_document(DocType::Rfc, rfc_id) {
+                            let status = doc.status.to_lowercase();
+                            if status != "implemented" && status != "superseded" {
+                                all_resolved = false;
+                                pending_rfcs.push(rfc_id.to_string());
+                            }
+                        } else {
+                            // RFC not found - don't block spike closure
+                        }
+                    }
+
+                    if !all_resolved {
+                        return Some(json!({
+                            "status": "partial",
+                            "spike": source_spike,
+                            "message": format!("Spike '{}' has pending RFCs: {}", source_spike, pending_rfcs.join(", ")),
+                            "pending_rfcs": pending_rfcs
+                        }));
+                    }
+                }
+            }
+        }
+
+        // All checks passed - close the spike
+        let _ = state.store.update_document_status(DocType::Spike, &source_spike, "complete");
+
+        // Rename spike file (.wip.md -> .done.md) via RFC 0031
+        if let Ok(Some(new_path)) = blue_core::rename_for_status(
+            &state.home.docs_path,
+            &state.store,
+            &spike_doc,
+            "complete"
+        ) {
+            let full_new_path = state.home.docs_path.join(&new_path);
+            let _ = blue_core::update_markdown_status(&full_new_path, "complete");
+        }
+
+        Some(json!({
+            "status": "closed",
+            "spike": source_spike,
+            "message": format!("Auto-closed spike '{}' - all produced RFCs are resolved", source_spike)
+        }))
+    }
+
+    /// RFC 0038: Get ADR suggestions for an RFC transitioning to in-progress
+    fn get_adr_suggestions(&self, rfc_title: &str) -> Option<Value> {
+        let state = self.state.as_ref()?;
+
+        // Use the existing ADR relevance handler
+        let args = json!({ "context": rfc_title });
+        let result = crate::handlers::adr::handle_relevant(state, &args).ok()?;
+
+        // Extract relevant ADRs with high confidence
+        let relevant = result.get("relevant")?.as_array()?;
+        if relevant.is_empty() {
+            return None;
+        }
+
+        // Filter to ADRs with confidence > 0.7
+        let high_confidence: Vec<&Value> = relevant
+            .iter()
+            .filter(|adr| {
+                adr.get("confidence")
+                    .and_then(|c| c.as_f64())
+                    .unwrap_or(0.0) > 0.7
+            })
+            .collect();
+
+        if high_confidence.is_empty() {
+            return None;
+        }
+
+        // Check for architectural keywords that suggest a new ADR might be needed
+        let title_lower = rfc_title.to_lowercase();
+        let architectural_keywords = ["breaking", "redesign", "architectural", "migration", "refactor"];
+        let suggests_new_adr = architectural_keywords.iter().any(|kw| title_lower.contains(kw));
+
+        Some(json!({
+            "relevant_adrs": high_confidence,
+            "suggests_new_adr": suggests_new_adr,
+            "hint": if suggests_new_adr {
+                "This RFC may warrant a new ADR after implementation. Consider using blue_adr_create."
+            } else {
+                "Review these ADRs while implementing."
+            }
+        }))
     }
 
     fn handle_rfc_plan(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
@@ -3518,6 +4108,53 @@ impl BlueServer {
         crate::handlers::dialogue::handle_save(state, args)
     }
 
+    fn handle_dialogue_round_prompt(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        crate::handlers::dialogue::handle_round_prompt(args)
+    }
+
+    fn handle_dialogue_sample_panel(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        crate::handlers::dialogue::handle_sample_panel(args)
+    }
+
+    fn handle_dialogue_evolve_panel(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        crate::handlers::dialogue::handle_evolve_panel(args)
+    }
+
+    // RFC 0051: Global perspective & tension tracking handlers
+
+    fn handle_dialogue_round_context(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        let state = self.ensure_state()?;
+        crate::handlers::dialogue::handle_round_context(state, args)
+    }
+
+    fn handle_dialogue_expert_create(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        let state = self.ensure_state()?;
+        crate::handlers::dialogue::handle_expert_create(state, args)
+    }
+
+    fn handle_dialogue_round_register(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        let state = self.ensure_state()?;
+        crate::handlers::dialogue::handle_round_register(state, args)
+    }
+
+    fn handle_dialogue_verdict_register(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        let state = self.ensure_state()?;
+        crate::handlers::dialogue::handle_verdict_register(state, args)
+    }
+
+    fn handle_dialogue_export(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
+        let state = self.ensure_state()?;
+        crate::handlers::dialogue::handle_export(state, args)
+    }
+
     fn handle_playwright_verify(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
         let args = args.as_ref().ok_or(ServerError::InvalidParams)?;
         crate::handlers::playwright::handle_verify(args)
@@ -3634,6 +4271,16 @@ impl BlueServer {
             .and_then(|a| a.get("state"))
             .and_then(|v| v.as_str());
         crate::handlers::realm::handle_notifications_list(self.cwd.as_deref(), state)
+    }
+
+    // RFC 0038: Realm RFC Validation
+    fn handle_validate_realm(&mut self, args: &Option<Value>) -> Result<Value, ServerError> {
+        let strict = args
+            .as_ref()
+            .and_then(|a| a.get("strict"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        crate::handlers::realm::handle_validate_realm(self.cwd.as_deref(), strict)
     }
 
     // RFC 0006: Delete handlers

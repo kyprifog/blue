@@ -3,9 +3,9 @@
 //! Handles git worktree operations for isolated feature development.
 //!
 //! Branch naming convention (RFC 0007):
-//! - RFC file: `NNNN-feature-description.md`
-//! - Branch: `feature-description` (number prefix stripped)
-//! - Worktree: `feature-description`
+//! - RFC file: `NNNN-feature-description.md` or "Feature Description" title
+//! - Branch: `feature/{slug}` where slug is lowercase with hyphens
+//! - Worktree: `{slug}` directory name
 
 use std::path::Path;
 
@@ -95,6 +95,47 @@ pub fn strip_rfc_number_prefix(title: &str) -> (String, Option<u32>) {
     }
 }
 
+/// Convert a title to a URL-safe slug
+///
+/// - Converts to lowercase
+/// - Replaces spaces and underscores with hyphens
+/// - Removes non-alphanumeric characters (except hyphens)
+/// - Collapses multiple hyphens
+/// - Trims leading/trailing hyphens
+fn slugify(title: &str) -> String {
+    let slug: String = title
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c
+            } else if c == ' ' || c == '_' {
+                '-'
+            } else {
+                '-'
+            }
+        })
+        .collect();
+
+    // Collapse multiple hyphens and trim
+    let mut result = String::new();
+    let mut prev_hyphen = false;
+    for c in slug.chars() {
+        if c == '-' {
+            if !prev_hyphen && !result.is_empty() {
+                result.push(c);
+            }
+            prev_hyphen = true;
+        } else {
+            result.push(c);
+            prev_hyphen = false;
+        }
+    }
+
+    // Trim trailing hyphen
+    result.trim_end_matches('-').to_string()
+}
+
 /// Handle blue_worktree_create
 pub fn handle_create(state: &ProjectState, args: &Value) -> Result<Value, ServerError> {
     let title = args
@@ -152,10 +193,11 @@ pub fn handle_create(state: &ProjectState, args: &Value) -> Result<Value, Server
         }));
     }
 
-    // Create branch name and worktree path (RFC 0007: strip number prefix)
+    // Create branch name and worktree path (RFC 0007: feature/{slug} convention)
     let (stripped_name, _rfc_number) = strip_rfc_number_prefix(title);
-    let branch_name = stripped_name.clone();
-    let worktree_path = state.home.worktrees_path.join(&stripped_name);
+    let slug = slugify(&stripped_name);
+    let branch_name = format!("feature/{}", slug);
+    let worktree_path = state.home.worktrees_path.join(&slug);
 
     // Try to create the git worktree
     let repo_path = state.home.root.clone();
@@ -291,9 +333,10 @@ pub fn handle_cleanup(state: &ProjectState, args: &Value) -> Result<Value, Serve
         .and_then(|v| v.as_str())
         .ok_or(ServerError::InvalidParams)?;
 
-    // Support both old (rfc/title) and new (stripped) naming conventions
+    // Support both old and new naming conventions - slugify for feature/ branches
     let (stripped_name, _) = strip_rfc_number_prefix(title);
-    let branch_name = stripped_name.clone();
+    let slug = slugify(&stripped_name);
+    let branch_name = format!("feature/{}", slug);
 
     // Find the RFC to get worktree info
     let doc = state
@@ -337,8 +380,9 @@ pub fn handle_cleanup(state: &ProjectState, args: &Value) -> Result<Value, Serve
     }
 
     // Remove worktree from git
-    let worktree_removed = if worktree.is_some() {
-        blue_core::repo::remove_worktree(&repo, &branch_name).is_ok()
+    let worktree_removed = if let Some(ref wt) = worktree {
+        let wt_path = Path::new(&wt.worktree_path);
+        blue_core::repo::remove_worktree(&repo, wt_path).is_ok()
     } else {
         false
     };
@@ -422,8 +466,9 @@ pub fn handle_remove(state: &ProjectState, args: &Value) -> Result<Value, Server
 
     // Remove from git
     let repo_path = state.home.root.clone();
+    let wt_path = Path::new(&worktree.worktree_path);
     if let Ok(repo) = git2::Repository::open(&repo_path) {
-        if let Err(e) = blue_core::repo::remove_worktree(&repo, &worktree.branch_name) {
+        if let Err(e) = blue_core::repo::remove_worktree(&repo, wt_path) {
             return Ok(json!({
                 "status": "error",
                 "message": blue_core::voice::error(
@@ -489,6 +534,28 @@ mod tests {
         let (stripped, number) = strip_rfc_number_prefix("0007feature");
         assert_eq!(stripped, "0007feature");
         assert_eq!(number, None);
+    }
+
+    #[test]
+    fn test_slugify() {
+        // Spaces to hyphens, lowercase
+        assert_eq!(slugify("Minimal Job Submission"), "minimal-job-submission");
+
+        // Already slugified
+        assert_eq!(slugify("consistent-branch-naming"), "consistent-branch-naming");
+
+        // Mixed case with spaces
+        assert_eq!(slugify("Add User Authentication"), "add-user-authentication");
+
+        // Underscores converted
+        assert_eq!(slugify("some_feature_name"), "some-feature-name");
+
+        // Special characters removed
+        assert_eq!(slugify("Feature: Add (New) Stuff!"), "feature-add-new-stuff");
+
+        // Multiple spaces/hyphens collapsed
+        assert_eq!(slugify("too   many   spaces"), "too-many-spaces");
+        assert_eq!(slugify("too---many---hyphens"), "too-many-hyphens");
     }
 
     #[test]

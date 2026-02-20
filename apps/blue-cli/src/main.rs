@@ -6,6 +6,182 @@ use clap::{Parser, Subcommand};
 use anyhow::Result;
 use blue_core::daemon::{DaemonClient, DaemonDb, DaemonPaths, DaemonState, run_daemon};
 use blue_core::realm::RealmService;
+use blue_core::ProjectState;
+use serde_json::json;
+
+// ============================================================================
+// RFC 0049: Synchronous Guard Command
+// ============================================================================
+//
+// The guard command runs BEFORE tokio runtime initialization to avoid hanging
+// issues when invoked from Claude Code hooks. Pre-init gates should not depend
+// on post-init infrastructure.
+
+/// Check if this is a guard command and handle it synchronously.
+/// Returns Some(exit_code) if handled, None to continue to tokio::main.
+fn maybe_handle_guard_sync() -> Option<i32> {
+    let args: Vec<String> = std::env::args().collect();
+
+    // Quick check: is this a guard command?
+    if args.len() >= 2 && args[1] == "guard" {
+        // Parse --path=VALUE
+        let path = args.iter()
+            .find(|a| a.starts_with("--path="))
+            .map(|a| &a[7..]);
+
+        if let Some(path) = path {
+            return Some(run_guard_sync(path));
+        }
+    }
+    None
+}
+
+/// Synchronous guard implementation - no tokio, no tracing, just the check.
+fn run_guard_sync(path_str: &str) -> i32 {
+    use std::path::Path;
+
+    // Check bypass environment variable
+    if std::env::var("BLUE_BYPASS_WORKTREE").is_ok() {
+        // Note: We skip audit logging in sync mode for simplicity
+        return 0; // Allow
+    }
+
+    let path = Path::new(path_str);
+
+    // Fast allowlist check
+    if is_in_allowlist_sync(path) {
+        return 0; // Allow
+    }
+
+    // Get cwd
+    let cwd = match std::env::current_dir() {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("guard: failed to get current directory");
+            return 1;
+        }
+    };
+
+    // Check worktree status
+    let git_path = cwd.join(".git");
+
+    if git_path.is_file() {
+        // This is a worktree (linked worktree has .git as a file)
+        if let Ok(content) = std::fs::read_to_string(&git_path) {
+            if content.starts_with("gitdir:") {
+                let dir_name = cwd.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+
+                let parent_is_worktrees = cwd.parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .map(|s| s == "worktrees")
+                    .unwrap_or(false);
+
+                let is_rfc = dir_name.starts_with("rfc-")
+                    || dir_name.starts_with("feature-")
+                    || parent_is_worktrees;
+
+                if is_rfc {
+                    let abs_path = if path.is_absolute() {
+                        path.to_path_buf()
+                    } else {
+                        cwd.join(path)
+                    };
+                    if abs_path.starts_with(&cwd) {
+                        return 0; // Allow writes in RFC worktree
+                    }
+                }
+            }
+        }
+        eprintln!("guard: blocked write to {} (not in RFC worktree scope)", path.display());
+        return 1;
+    } else if git_path.is_dir() {
+        // Main repository - check branch
+        if let Ok(output) = std::process::Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(&cwd)
+            .output()
+        {
+            let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let is_rfc = branch.starts_with("feature/")
+                || branch.starts_with("rfc/")
+                || branch.starts_with("rfc-");
+
+            if is_rfc {
+                return 0; // Allow - on RFC branch
+            }
+        }
+
+        // Not on RFC branch - check if source code
+        if is_source_code_path_sync(path) {
+            eprintln!("guard: blocked write to {} (no active worktree)", path.display());
+            eprintln!("hint: Create a worktree with 'blue worktree create <rfc-title>' first");
+            return 1;
+        }
+        return 0; // Allow non-source-code files
+    }
+
+    // No .git - allow (not a git repo)
+    0
+}
+
+/// Synchronous allowlist check (RFC 0049)
+fn is_in_allowlist_sync(path: &std::path::Path) -> bool {
+    let path_str = path.to_string_lossy();
+
+    let allowlist = [
+        ".blue/docs/",
+        ".claude/",
+        "/tmp/",
+        ".gitignore",
+        ".blue/audit/",
+    ];
+
+    for pattern in &allowlist {
+        if path_str.contains(pattern) {
+            return true;
+        }
+    }
+
+    // Root-level markdown (not in crates/ or src/)
+    if path_str.ends_with(".md") && !path_str.contains("crates/") && !path_str.contains("src/") {
+        return true;
+    }
+
+    // Dialogue temp files
+    if path_str.contains("/tmp/blue-dialogue/") {
+        return true;
+    }
+
+    false
+}
+
+/// Synchronous source code path check (RFC 0049)
+fn is_source_code_path_sync(path: &std::path::Path) -> bool {
+    let path_str = path.to_string_lossy();
+
+    let source_patterns = ["src/", "crates/", "apps/", "lib/", "packages/", "tests/"];
+    for pattern in &source_patterns {
+        if path_str.contains(pattern) {
+            return true;
+        }
+    }
+
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let code_extensions = ["rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "c", "cpp", "h"];
+        if code_extensions.contains(&ext) {
+            return true;
+        }
+    }
+
+    false
+}
+
+// ============================================================================
+// End RFC 0049
+// ============================================================================
 
 #[derive(Parser)]
 #[command(name = "blue")]
@@ -19,7 +195,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Welcome home - initialize Blue in this directory
-    Init,
+    Init {
+        /// Reinitialize even if .blue/ already exists
+        #[arg(long)]
+        force: bool,
+    },
 
     /// Get project status
     Status,
@@ -121,6 +301,88 @@ enum Commands {
     Context {
         #[command(subcommand)]
         command: Option<ContextCommands>,
+    },
+
+    /// Guard: Check if file writes are allowed (RFC 0038 PreToolUse hook)
+    Guard {
+        /// Path to check
+        #[arg(long)]
+        path: String,
+
+        /// Tool that triggered the check (for audit logging)
+        #[arg(long)]
+        tool: Option<String>,
+    },
+
+    /// Session heartbeat (silent, used by hooks)
+    #[command(name = "session-heartbeat")]
+    SessionHeartbeat,
+
+    /// Session end (silent, used by hooks)
+    #[command(name = "session-end")]
+    SessionEnd,
+
+    /// Install Blue for Claude Code (RFC 0052)
+    Install {
+        /// Only install hooks
+        #[arg(long)]
+        hooks_only: bool,
+
+        /// Only install skills
+        #[arg(long)]
+        skills_only: bool,
+
+        /// Only configure MCP server
+        #[arg(long)]
+        mcp_only: bool,
+
+        /// Overwrite existing files
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Remove Blue from Claude Code (RFC 0052)
+    Uninstall,
+
+    /// Check Blue installation health (RFC 0052)
+    Doctor,
+
+    // ==================== RFC 0057: CLI Parity ====================
+
+    /// Dialogue commands (alignment dialogues)
+    Dialogue {
+        #[command(subcommand)]
+        command: DialogueCommands,
+    },
+
+    /// ADR commands (Architecture Decision Records)
+    Adr {
+        #[command(subcommand)]
+        command: AdrCommands,
+    },
+
+    /// Spike commands (time-boxed investigations)
+    Spike {
+        #[command(subcommand)]
+        command: SpikeCommands,
+    },
+
+    /// Audit commands
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommands,
+    },
+
+    /// PRD commands (Product Requirements Documents)
+    Prd {
+        #[command(subcommand)]
+        command: PrdCommands,
+    },
+
+    /// Reminder commands
+    Reminder {
+        #[command(subcommand)]
+        command: ReminderCommands,
     },
 }
 
@@ -317,6 +579,9 @@ enum SessionCommands {
 
     /// Show session status
     Status,
+
+    /// Record session heartbeat (used by hooks)
+    Heartbeat,
 }
 
 #[derive(Subcommand)]
@@ -417,8 +682,171 @@ enum IndexCommands {
     Status,
 }
 
+// ==================== RFC 0057: CLI Parity Command Enums ====================
+
+#[derive(Subcommand)]
+enum DialogueCommands {
+    /// Create a new dialogue
+    Create {
+        /// Dialogue title
+        title: String,
+
+        /// Enable alignment mode with expert panel
+        #[arg(long)]
+        alignment: bool,
+
+        /// Panel size for alignment mode
+        #[arg(long)]
+        panel_size: Option<usize>,
+    },
+    /// Get dialogue details
+    Get {
+        /// Dialogue title or ID
+        title: String,
+    },
+    /// List all dialogues
+    List,
+    /// Export dialogue to JSON
+    Export {
+        /// Dialogue ID
+        dialogue_id: String,
+
+        /// Output path (optional)
+        #[arg(long)]
+        output: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdrCommands {
+    /// Create a new ADR
+    Create {
+        /// ADR title
+        title: String,
+    },
+    /// Get ADR details
+    Get {
+        /// ADR title
+        title: String,
+    },
+    /// List all ADRs
+    List,
+    /// Update ADR status
+    Status {
+        /// ADR title
+        title: String,
+
+        /// New status (proposed, accepted, deprecated, superseded)
+        status: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SpikeCommands {
+    /// Create a new spike
+    Create {
+        /// Spike title
+        title: String,
+
+        /// Time budget in hours
+        #[arg(long, default_value = "4")]
+        budget: u32,
+    },
+    /// Get spike details
+    Get {
+        /// Spike title
+        title: String,
+    },
+    /// List all spikes
+    List,
+    /// Complete a spike
+    Complete {
+        /// Spike title
+        title: String,
+
+        /// Outcome (success, partial, failure)
+        #[arg(long)]
+        outcome: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuditCommands {
+    /// Create a new audit document
+    Create {
+        /// Audit title
+        title: String,
+    },
+    /// Get audit details
+    Get {
+        /// Audit title
+        title: String,
+    },
+    /// List all audits
+    List,
+}
+
+#[derive(Subcommand)]
+enum PrdCommands {
+    /// Create a new PRD
+    Create {
+        /// PRD title
+        title: String,
+    },
+    /// Get PRD details
+    Get {
+        /// PRD title
+        title: String,
+    },
+    /// List all PRDs
+    List,
+}
+
+#[derive(Subcommand)]
+enum ReminderCommands {
+    /// Create a new reminder
+    Create {
+        /// Reminder message
+        message: String,
+
+        /// When to remind (e.g., "tomorrow", "2024-03-15")
+        #[arg(long)]
+        when: String,
+    },
+    /// List all reminders
+    List,
+    /// Snooze a reminder
+    Snooze {
+        /// Reminder ID
+        id: i64,
+
+        /// Snooze until (e.g., "1h", "tomorrow")
+        #[arg(long)]
+        until: String,
+    },
+    /// Dismiss a reminder
+    Dismiss {
+        /// Reminder ID
+        id: i64,
+    },
+}
+
+/// Entry point - handles guard synchronously before tokio (RFC 0049)
+fn main() {
+    // RFC 0049: Handle guard command synchronously before tokio runtime
+    if let Some(exit_code) = maybe_handle_guard_sync() {
+        std::process::exit(exit_code);
+    }
+
+    // Normal path: run tokio runtime
+    if let Err(e) = tokio_main() {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn tokio_main() -> Result<()> {
     let cli = Cli::parse();
 
     // RFC 0020: MCP debug mode logs to file at DEBUG level
@@ -445,9 +873,38 @@ async fn main() -> Result<()> {
         None | Some(Commands::Status) => {
             println!("{}", blue_core::voice::welcome());
         }
-        Some(Commands::Init) => {
+        Some(Commands::Init { force }) => {
+            let cwd = std::env::current_dir()?;
+            let blue_dir = cwd.join(".blue");
+
+            // Check if already initialized
+            if blue_dir.exists() && !force {
+                println!("Blue already initialized in this directory.");
+                println!("  {}", blue_dir.display());
+                println!();
+                println!("Use --force to reinitialize.");
+                return Ok(());
+            }
+
+            // detect_blue auto-creates .blue/ per RFC 0003
+            let home = blue_core::detect_blue(&cwd)
+                .map_err(|e| anyhow::anyhow!("Failed to initialize: {}", e))?;
+
+            // Load state to ensure database is created with schema
+            let project = home.project_name.clone().unwrap_or_else(|| "default".to_string());
+            let _state = blue_core::ProjectState::load(home.clone(), &project)
+                .map_err(|e| anyhow::anyhow!("Failed to create database: {}", e))?;
+
             println!("{}", blue_core::voice::welcome());
-            // TODO: Initialize .blue directory
+            println!();
+            println!("Initialized Blue:");
+            println!("  Root:     {}", home.root.display());
+            println!("  Database: {}", home.db_path.display());
+            println!("  Docs:     {}", home.docs_path.display());
+            println!();
+            println!("Next steps:");
+            println!("  blue rfc create \"My First RFC\"");
+            println!("  blue status");
         }
         Some(Commands::Next) => {
             println!("Looking at what's ready. One moment.");
@@ -518,6 +975,55 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Context { command }) => {
             handle_context_command(command).await?;
+        }
+        Some(Commands::Guard { path, tool }) => {
+            handle_guard_command(&path, tool.as_deref()).await?;
+        }
+        Some(Commands::SessionHeartbeat) => {
+            // Silent heartbeat - touch session file if it exists
+            let cwd = std::env::current_dir()?;
+            let session_file = cwd.join(".blue").join("session");
+            if session_file.exists() {
+                if let Ok(content) = std::fs::read_to_string(&session_file) {
+                    let _ = std::fs::write(&session_file, content);
+                }
+            }
+        }
+        Some(Commands::SessionEnd) => {
+            // Silent session end - remove session file if it exists
+            let cwd = std::env::current_dir()?;
+            let session_file = cwd.join(".blue").join("session");
+            if session_file.exists() {
+                let _ = std::fs::remove_file(&session_file);
+            }
+        }
+        Some(Commands::Install { hooks_only, skills_only, mcp_only, force }) => {
+            handle_install_command(hooks_only, skills_only, mcp_only, force).await?;
+        }
+        Some(Commands::Uninstall) => {
+            handle_uninstall_command().await?;
+        }
+        Some(Commands::Doctor) => {
+            handle_doctor_command().await?;
+        }
+        // RFC 0057: CLI Parity commands
+        Some(Commands::Dialogue { command }) => {
+            handle_dialogue_command(command).await?;
+        }
+        Some(Commands::Adr { command }) => {
+            handle_adr_command(command).await?;
+        }
+        Some(Commands::Spike { command }) => {
+            handle_spike_command(command).await?;
+        }
+        Some(Commands::Audit { command }) => {
+            handle_audit_command(command).await?;
+        }
+        Some(Commands::Prd { command }) => {
+            handle_prd_command(command).await?;
+        }
+        Some(Commands::Reminder { command }) => {
+            handle_reminder_command(command).await?;
         }
     }
 
@@ -1238,6 +1744,20 @@ async fn handle_session_command(command: SessionCommands) -> Result<()> {
                     );
                 }
             }
+        }
+
+        SessionCommands::Heartbeat => {
+            // Silent heartbeat - just touch the session file to update activity
+            let cwd = std::env::current_dir()?;
+            let session_file = cwd.join(".blue").join("session");
+
+            if session_file.exists() {
+                // Touch file by reading and writing back (updates mtime)
+                if let Ok(content) = std::fs::read_to_string(&session_file) {
+                    let _ = std::fs::write(&session_file, content);
+                }
+            }
+            // Silent success - no output for hooks
         }
     }
 
@@ -2224,4 +2744,1177 @@ fn print_context_verbose(manifest: &blue_core::ContextManifest, resolution: &blu
             }
         }
     }
+}
+
+// ==================== Guard Command (RFC 0038) ====================
+
+/// Check if file write is allowed based on worktree and allowlist rules.
+///
+/// Exit codes:
+/// - 0: Allow the write
+/// - 1: Block the write (not in valid worktree and not in allowlist)
+async fn handle_guard_command(path: &str, tool: Option<&str>) -> Result<()> {
+    use std::path::Path;
+
+    // Check for bypass environment variable
+    if std::env::var("BLUE_BYPASS_WORKTREE").is_ok() {
+        // Log bypass for audit
+        log_guard_bypass(path, tool, "BLUE_BYPASS_WORKTREE env set");
+        return Ok(()); // Exit 0 = allow
+    }
+
+    let path = Path::new(path);
+
+    // Check allowlist patterns first (fast path)
+    if is_in_allowlist(path) {
+        return Ok(()); // Exit 0 = allow
+    }
+
+    // Get current working directory
+    let cwd = std::env::current_dir()?;
+
+    // Check if we're in a git worktree
+    let worktree_info = get_worktree_info(&cwd)?;
+
+    match worktree_info {
+        Some(info) => {
+            // We're in a worktree - check if it's associated with an RFC
+            if info.is_rfc_worktree {
+                // Check if the path is inside this worktree
+                let abs_path = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    cwd.join(path)
+                };
+
+                if abs_path.starts_with(&info.worktree_path) {
+                    return Ok(()); // Exit 0 = allow writes in RFC worktree
+                }
+            }
+            // Not in allowlist and not in RFC worktree scope
+            eprintln!("guard: blocked write to {} (not in RFC worktree scope)", path.display());
+            std::process::exit(1);
+        }
+        None => {
+            // Not in a worktree - check if there's an active RFC that might apply
+            // For now, block writes to source code outside worktrees
+            if is_source_code_path(path) {
+                eprintln!("guard: blocked write to {} (no active worktree)", path.display());
+                eprintln!("hint: Create a worktree with 'blue worktree create <rfc-title>' first");
+                std::process::exit(1);
+            }
+            // Non-source-code files are allowed
+            Ok(())
+        }
+    }
+}
+
+/// Allowlist patterns for files that can always be written
+fn is_in_allowlist(path: &std::path::Path) -> bool {
+    let path_str = path.to_string_lossy();
+
+    // Always-allowed patterns
+    let allowlist = [
+        ".blue/docs/",      // Blue documentation
+        ".claude/",         // Claude configuration
+        "/tmp/",            // Temp files
+        "*.md",             // Markdown at root (but not in crates/)
+        ".gitignore",       // Git config
+        ".blue/audit/",     // Audit logs
+    ];
+
+    for pattern in &allowlist {
+        if pattern.starts_with("*.") {
+            // Extension pattern - check only root level
+            let ext = &pattern[1..];
+            if path_str.ends_with(ext) && !path_str.contains("crates/") && !path_str.contains("src/") {
+                return true;
+            }
+        } else if path_str.contains(pattern) {
+            return true;
+        }
+    }
+
+    // Check for dialogue temp files
+    if path_str.contains("/tmp/blue-dialogue/") {
+        return true;
+    }
+
+    false
+}
+
+/// Check if a path looks like source code
+fn is_source_code_path(path: &std::path::Path) -> bool {
+    let path_str = path.to_string_lossy();
+
+    // Source code indicators
+    let source_patterns = [
+        "src/",
+        "crates/",
+        "apps/",
+        "lib/",
+        "packages/",
+        "tests/",
+    ];
+
+    for pattern in &source_patterns {
+        if path_str.contains(pattern) {
+            return true;
+        }
+    }
+
+    // Check file extensions
+    if let Some(ext) = path.extension().and_then(|e: &std::ffi::OsStr| e.to_str()) {
+        let code_extensions = ["rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "c", "cpp", "h"];
+        if code_extensions.contains(&ext) {
+            return true;
+        }
+    }
+
+    false
+}
+
+struct WorktreeInfo {
+    worktree_path: std::path::PathBuf,
+    is_rfc_worktree: bool,
+}
+
+/// Get information about the current git worktree
+fn get_worktree_info(cwd: &std::path::Path) -> Result<Option<WorktreeInfo>> {
+    // Check if we're in a git worktree by looking at .git file
+    let git_path = cwd.join(".git");
+
+    if git_path.is_file() {
+        // This is a worktree (linked worktree has .git as a file)
+        let content = std::fs::read_to_string(&git_path)?;
+        if content.starts_with("gitdir:") {
+            // Parse the worktree path
+            let worktree_path = cwd.to_path_buf();
+
+            // Check if this looks like an RFC worktree
+            // RFC worktrees are typically named feature/<rfc-slug> or rfc/<rfc-slug>
+            let dir_name = cwd.file_name()
+                .and_then(|n: &std::ffi::OsStr| n.to_str())
+                .unwrap_or("");
+
+            let parent_is_worktrees = cwd.parent()
+                .and_then(|p: &std::path::Path| p.file_name())
+                .and_then(|n: &std::ffi::OsStr| n.to_str())
+                .map(|s: &str| s == "worktrees")
+                .unwrap_or(false);
+
+            let is_rfc = dir_name.starts_with("rfc-")
+                || dir_name.starts_with("feature-")
+                || parent_is_worktrees;
+
+            return Ok(Some(WorktreeInfo {
+                worktree_path,
+                is_rfc_worktree: is_rfc,
+            }));
+        }
+    } else if git_path.is_dir() {
+        // Main repository - check if we're on an RFC branch
+        let output = std::process::Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(cwd)
+            .output();
+
+        if let Ok(output) = output {
+            let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let is_rfc = branch.starts_with("feature/")
+                || branch.starts_with("rfc/")
+                || branch.starts_with("rfc-");
+
+            return Ok(Some(WorktreeInfo {
+                worktree_path: cwd.to_path_buf(),
+                is_rfc_worktree: is_rfc,
+            }));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Log a guard bypass for audit trail
+fn log_guard_bypass(path: &str, tool: Option<&str>, reason: &str) {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(_) => return,
+    };
+
+    let audit_dir = cwd.join(".blue").join("audit");
+    if std::fs::create_dir_all(&audit_dir).is_err() {
+        return;
+    }
+
+    let log_path = audit_dir.join("guard-bypass.log");
+    let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    let tool_str = tool.unwrap_or("unknown");
+    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+
+    let entry = format!("{} | {} | {} | {} | {}\n", timestamp, user, tool_str, path, reason);
+
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        let _ = file.write_all(entry.as_bytes());
+    }
+}
+
+// ============================================================================
+// RFC 0052: Blue Install Command
+// ============================================================================
+
+const SESSION_START_HOOK: &str = r#"#!/bin/bash
+# Managed by: blue install
+# Blue SessionStart hook - sets up PATH for Claude Code
+
+if [ -n "$CLAUDE_ENV_FILE" ] && [ -n "$CLAUDE_PROJECT_DIR" ]; then
+  echo "export PATH=\"\$CLAUDE_PROJECT_DIR/target/release:\$PATH\"" >> "$CLAUDE_ENV_FILE"
+fi
+
+exit 0
+"#;
+
+const GUARD_WRITE_HOOK: &str = r#"#!/bin/bash
+# Managed by: blue install
+# Blue PreToolUse hook - enforces RFC 0038 worktree protection
+
+# Read stdin with bash timeout (portable, no GNU timeout needed)
+INPUT=""
+while IFS= read -t 2 -r line; do
+    INPUT="${INPUT}${line}"
+done
+
+if [ -z "$INPUT" ]; then
+    exit 0
+fi
+
+FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // empty' 2>/dev/null || echo "")
+
+if [ -z "$FILE_PATH" ]; then
+    exit 0
+fi
+
+blue guard --path="$FILE_PATH"
+"#;
+
+async fn handle_install_command(hooks_only: bool, skills_only: bool, mcp_only: bool, force: bool) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+
+    println!("Installing Blue for Claude Code...\n");
+
+    let install_all = !hooks_only && !skills_only && !mcp_only;
+
+    // Install hooks
+    if install_all || hooks_only {
+        println!("Hooks:");
+        install_hooks(&cwd, force)?;
+    }
+
+    // Install skills
+    if install_all || skills_only {
+        println!("\nSkills:");
+        install_skills(&cwd, &home)?;
+    }
+
+    // Install MCP server
+    if install_all || mcp_only {
+        println!("\nMCP Server:");
+        install_mcp_server(&cwd, &home)?;
+    }
+
+    println!("\nBlue installed. Restart Claude Code to activate.");
+    Ok(())
+}
+
+fn install_hooks(project_dir: &std::path::Path, force: bool) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let hooks_dir = project_dir.join(".claude").join("hooks");
+    std::fs::create_dir_all(&hooks_dir)?;
+
+    // Write session-start.sh
+    let session_start_path = hooks_dir.join("session-start.sh");
+    if !session_start_path.exists() || force {
+        std::fs::write(&session_start_path, SESSION_START_HOOK)?;
+        std::fs::set_permissions(&session_start_path, std::fs::Permissions::from_mode(0o755))?;
+        println!("  ✓ .claude/hooks/session-start.sh");
+    } else {
+        println!("  - .claude/hooks/session-start.sh (exists, use --force to overwrite)");
+    }
+
+    // Write guard-write.sh
+    let guard_write_path = hooks_dir.join("guard-write.sh");
+    if !guard_write_path.exists() || force {
+        std::fs::write(&guard_write_path, GUARD_WRITE_HOOK)?;
+        std::fs::set_permissions(&guard_write_path, std::fs::Permissions::from_mode(0o755))?;
+        println!("  ✓ .claude/hooks/guard-write.sh");
+    } else {
+        println!("  - .claude/hooks/guard-write.sh (exists, use --force to overwrite)");
+    }
+
+    // Update settings.json
+    let settings_path = project_dir.join(".claude").join("settings.json");
+    let settings = merge_hook_settings(&settings_path)?;
+    std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+    println!("  ✓ .claude/settings.json (merged)");
+
+    Ok(())
+}
+
+fn merge_hook_settings(settings_path: &std::path::Path) -> Result<serde_json::Value> {
+    use serde_json::json;
+
+    let mut settings: serde_json::Value = if settings_path.exists() {
+        let content = std::fs::read_to_string(settings_path)?;
+        serde_json::from_str(&content).unwrap_or_else(|_| json!({}))
+    } else {
+        json!({})
+    };
+
+    // Ensure hooks object exists
+    if settings.get("hooks").is_none() {
+        settings["hooks"] = json!({});
+    }
+
+    // Add SessionStart hook
+    settings["hooks"]["SessionStart"] = json!([
+        {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": ".claude/hooks/session-start.sh"
+                }
+            ]
+        }
+    ]);
+
+    // Add PreToolUse hook
+    settings["hooks"]["PreToolUse"] = json!([
+        {
+            "matcher": "Write|Edit|MultiEdit",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": ".claude/hooks/guard-write.sh"
+                }
+            ]
+        }
+    ]);
+
+    Ok(settings)
+}
+
+fn install_skills(project_dir: &std::path::Path, home: &std::path::Path) -> Result<()> {
+    let skills_dir = project_dir.join("skills");
+    let target_dir = home.join(".claude").join("skills");
+
+    std::fs::create_dir_all(&target_dir)?;
+
+    if !skills_dir.exists() {
+        println!("  - No skills directory found");
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(&skills_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_dir() {
+            let skill_name = entry.file_name();
+            let link_path = target_dir.join(&skill_name);
+
+            // Remove existing symlink if present
+            if link_path.exists() || link_path.symlink_metadata().is_ok() {
+                std::fs::remove_file(&link_path).ok();
+            }
+
+            // Create symlink
+            std::os::unix::fs::symlink(&path, &link_path)?;
+            println!("  ✓ ~/.claude/skills/{} -> {}", skill_name.to_string_lossy(), path.display());
+        }
+    }
+
+    Ok(())
+}
+
+fn install_mcp_server(project_dir: &std::path::Path, home: &std::path::Path) -> Result<()> {
+    use serde_json::json;
+
+    let config_path = home.join(".claude.json");
+
+    let mut config: serde_json::Value = if config_path.exists() {
+        let content = std::fs::read_to_string(&config_path)?;
+        serde_json::from_str(&content).unwrap_or_else(|_| json!({}))
+    } else {
+        json!({})
+    };
+
+    // Ensure mcpServers object exists
+    if config.get("mcpServers").is_none() {
+        config["mcpServers"] = json!({});
+    }
+
+    // Add/update blue MCP server
+    let binary_path = project_dir.join("target").join("release").join("blue");
+    config["mcpServers"]["blue"] = json!({
+        "command": binary_path.to_string_lossy(),
+        "args": ["mcp"]
+    });
+
+    std::fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
+    println!("  ✓ ~/.claude.json (blue server configured)");
+
+    Ok(())
+}
+
+async fn handle_uninstall_command() -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+
+    println!("Removing Blue from Claude Code...\n");
+
+    // Remove hooks
+    println!("Hooks:");
+    uninstall_hooks(&cwd)?;
+
+    // Remove skills
+    println!("\nSkills:");
+    uninstall_skills(&cwd, &home)?;
+
+    // Remove MCP server
+    println!("\nMCP Server:");
+    uninstall_mcp_server(&home)?;
+
+    println!("\nBlue uninstalled.");
+    Ok(())
+}
+
+fn uninstall_hooks(project_dir: &std::path::Path) -> Result<()> {
+    let hooks_dir = project_dir.join(".claude").join("hooks");
+
+    // Remove hook scripts
+    let session_start = hooks_dir.join("session-start.sh");
+    if session_start.exists() {
+        // Check if managed by blue
+        if let Ok(content) = std::fs::read_to_string(&session_start) {
+            if content.contains("Managed by: blue install") {
+                std::fs::remove_file(&session_start)?;
+                println!("  ✓ Removed .claude/hooks/session-start.sh");
+            } else {
+                println!("  - .claude/hooks/session-start.sh (not managed by blue, skipped)");
+            }
+        }
+    }
+
+    let guard_write = hooks_dir.join("guard-write.sh");
+    if guard_write.exists() {
+        if let Ok(content) = std::fs::read_to_string(&guard_write) {
+            if content.contains("Managed by: blue install") {
+                std::fs::remove_file(&guard_write)?;
+                println!("  ✓ Removed .claude/hooks/guard-write.sh");
+            } else {
+                println!("  - .claude/hooks/guard-write.sh (not managed by blue, skipped)");
+            }
+        }
+    }
+
+    // Clean settings.json
+    let settings_path = project_dir.join(".claude").join("settings.json");
+    if settings_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&settings_path) {
+            if let Ok(mut settings) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(hooks) = settings.get_mut("hooks") {
+                    if let Some(obj) = hooks.as_object_mut() {
+                        obj.remove("SessionStart");
+                        obj.remove("PreToolUse");
+                    }
+                }
+                std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+                println!("  ✓ Cleaned .claude/settings.json");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn uninstall_skills(project_dir: &std::path::Path, home: &std::path::Path) -> Result<()> {
+    let skills_dir = project_dir.join("skills");
+    let target_dir = home.join(".claude").join("skills");
+
+    if !skills_dir.exists() {
+        println!("  - No skills to remove");
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(&skills_dir)? {
+        let entry = entry?;
+        if entry.path().is_dir() {
+            let skill_name = entry.file_name();
+            let link_path = target_dir.join(&skill_name);
+
+            if link_path.symlink_metadata().is_ok() {
+                std::fs::remove_file(&link_path)?;
+                println!("  ✓ Removed ~/.claude/skills/{}", skill_name.to_string_lossy());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn uninstall_mcp_server(home: &std::path::Path) -> Result<()> {
+    let config_path = home.join(".claude.json");
+
+    if config_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&config_path) {
+            if let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(servers) = config.get_mut("mcpServers") {
+                    if let Some(obj) = servers.as_object_mut() {
+                        obj.remove("blue");
+                    }
+                }
+                std::fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
+                println!("  ✓ Removed blue from ~/.claude.json");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_doctor_command() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let cwd = std::env::current_dir()?;
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+
+    println!("Blue Installation Health Check\n");
+
+    let mut issues = 0;
+
+    // Check binary
+    println!("Binary:");
+    let binary_path = which::which("blue").ok();
+    if let Some(ref path) = binary_path {
+        println!("  ✓ blue found at {}", path.display());
+
+        // RFC 0060: macOS-specific signature and liveness checks
+        #[cfg(target_os = "macos")]
+        {
+            // Check for stale provenance xattr
+            let xattr_output = std::process::Command::new("xattr")
+                .arg("-l")
+                .arg(path)
+                .output();
+
+            if let Ok(output) = xattr_output {
+                let attrs = String::from_utf8_lossy(&output.stdout);
+                if attrs.contains("com.apple.provenance") {
+                    println!("  ⚠ com.apple.provenance xattr present (may cause hangs)");
+                    println!("    hint: xattr -cr {} && codesign --force --sign - {}",
+                             path.display(), path.display());
+                    issues += 1;
+                }
+            }
+
+            // Check code signature validity
+            let codesign_output = std::process::Command::new("codesign")
+                .args(["--verify", "--verbose"])
+                .arg(path)
+                .output();
+
+            if let Ok(output) = codesign_output {
+                if output.status.success() {
+                    println!("  ✓ Code signature valid");
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if stderr.contains("invalid signature") || stderr.contains("modified") {
+                        println!("  ✗ Code signature invalid or stale");
+                        println!("    hint: codesign --force --sign - {}", path.display());
+                        issues += 1;
+                    } else if stderr.contains("not signed") {
+                        println!("  - Binary not signed (may be fine)");
+                    }
+                }
+            }
+
+            // Liveness check with timeout
+            use std::time::Duration;
+            let liveness = std::process::Command::new(path)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .and_then(|mut child| {
+                    // Wait up to 3 seconds
+                    let start = std::time::Instant::now();
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(status)) => return Ok(status.success()),
+                            Ok(None) => {
+                                if start.elapsed() > Duration::from_secs(3) {
+                                    let _ = child.kill();
+                                    return Ok(false);
+                                }
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                });
+
+            match liveness {
+                Ok(true) => println!("  ✓ Binary responds within timeout"),
+                Ok(false) => {
+                    println!("  ✗ Binary hangs (dyld signature issue)");
+                    println!("    hint: cargo install --path apps/blue-cli --force");
+                    issues += 1;
+                }
+                Err(e) => println!("  ⚠ Could not run liveness check: {}", e),
+            }
+        }
+    } else {
+        println!("  ✗ blue not found in PATH");
+        issues += 1;
+    }
+
+    // Check hooks
+    println!("\nHooks:");
+    let hooks_dir = cwd.join(".claude").join("hooks");
+
+    let session_start = hooks_dir.join("session-start.sh");
+    if session_start.exists() {
+        let is_executable = std::fs::metadata(&session_start)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false);
+        if is_executable {
+            println!("  ✓ session-start.sh (installed, executable)");
+        } else {
+            println!("  ✗ session-start.sh (not executable)");
+            issues += 1;
+        }
+    } else {
+        println!("  ✗ session-start.sh missing");
+        issues += 1;
+    }
+
+    let guard_write = hooks_dir.join("guard-write.sh");
+    if guard_write.exists() {
+        let is_executable = std::fs::metadata(&guard_write)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false);
+        if is_executable {
+            println!("  ✓ guard-write.sh (installed, executable)");
+        } else {
+            println!("  ✗ guard-write.sh (not executable)");
+            issues += 1;
+        }
+    } else {
+        println!("  ✗ guard-write.sh missing");
+        issues += 1;
+    }
+
+    let settings_path = cwd.join(".claude").join("settings.json");
+    if settings_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&settings_path) {
+            if content.contains("SessionStart") && content.contains("PreToolUse") {
+                println!("  ✓ settings.json configured");
+            } else {
+                println!("  ✗ settings.json missing hook configuration");
+                issues += 1;
+            }
+        }
+    } else {
+        println!("  ✗ settings.json missing");
+        issues += 1;
+    }
+
+    // Check skills
+    println!("\nSkills:");
+    let skills_dir = cwd.join("skills");
+    let target_dir = home.join(".claude").join("skills");
+
+    if skills_dir.exists() {
+        for entry in std::fs::read_dir(&skills_dir)? {
+            let entry = entry?;
+            if entry.path().is_dir() {
+                let skill_name = entry.file_name();
+                let link_path = target_dir.join(&skill_name);
+
+                if link_path.symlink_metadata().is_ok() {
+                    // Check if symlink points to correct target
+                    if let Ok(target) = std::fs::read_link(&link_path) {
+                        if target == entry.path() {
+                            println!("  ✓ {} (symlink valid)", skill_name.to_string_lossy());
+                        } else {
+                            println!("  ✗ {} (symlink points to wrong target)", skill_name.to_string_lossy());
+                            issues += 1;
+                        }
+                    }
+                } else {
+                    println!("  ✗ {} (symlink missing)", skill_name.to_string_lossy());
+                    issues += 1;
+                }
+            }
+        }
+    } else {
+        println!("  - No skills directory");
+    }
+
+    // Check MCP server
+    println!("\nMCP Server:");
+    let config_path = home.join(".claude.json");
+    if config_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&config_path) {
+            if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(servers) = config.get("mcpServers") {
+                    if servers.get("blue").is_some() {
+                        println!("  ✓ blue configured in ~/.claude.json");
+
+                        // Check if binary path is correct
+                        if let Some(cmd) = servers["blue"].get("command").and_then(|c| c.as_str()) {
+                            if std::path::Path::new(cmd).exists() {
+                                println!("  ✓ Binary path valid");
+                            } else {
+                                println!("  ✗ Binary path invalid: {}", cmd);
+                                issues += 1;
+                            }
+                        }
+                    } else {
+                        println!("  ✗ blue not configured in ~/.claude.json");
+                        issues += 1;
+                    }
+                } else {
+                    println!("  ✗ No mcpServers in ~/.claude.json");
+                    issues += 1;
+                }
+            }
+        }
+    } else {
+        println!("  ✗ ~/.claude.json not found");
+        issues += 1;
+    }
+
+    // Summary
+    println!();
+    if issues == 0 {
+        println!("All checks passed.");
+    } else {
+        println!("{} issue(s) found. Run `blue install` to fix.", issues);
+    }
+
+    Ok(())
+}
+
+// ==================== RFC 0057: CLI Parity Handlers ====================
+
+/// Get or create project state for CLI commands
+fn get_project_state() -> Result<ProjectState> {
+    let cwd = std::env::current_dir()?;
+    let home = blue_core::detect_blue(&cwd)
+        .map_err(|e| anyhow::anyhow!("Not a Blue project: {}", e))?;
+    let project = home.project_name.clone().unwrap_or_else(|| "default".to_string());
+    ProjectState::load(home, &project)
+        .map_err(|e| anyhow::anyhow!("Failed to load project state: {}", e))
+}
+
+/// Handle dialogue subcommands
+async fn handle_dialogue_command(command: DialogueCommands) -> Result<()> {
+    let mut state = get_project_state()?;
+
+    match command {
+        DialogueCommands::Create { title, alignment, panel_size } => {
+            let args = json!({
+                "title": title,
+                "alignment": alignment,
+                "panel_size": panel_size,
+            });
+            match blue_mcp::handlers::dialogue::handle_create(&mut state, &args) {
+                Ok(result) => {
+                    if let Some(msg) = result.get("message").and_then(|v| v.as_str()) {
+                        println!("{}", msg);
+                    }
+                    if let Some(file) = result.get("dialogue").and_then(|d| d.get("file")).and_then(|v| v.as_str()) {
+                        println!("File: {}", file);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        DialogueCommands::Get { title } => {
+            let args = json!({ "title": title });
+            match blue_mcp::handlers::dialogue::handle_get(&state, &args) {
+                Ok(result) => {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        DialogueCommands::List => {
+            let args = json!({});
+            match blue_mcp::handlers::dialogue::handle_list(&state, &args) {
+                Ok(result) => {
+                    if let Some(dialogues) = result.get("dialogues").and_then(|v| v.as_array()) {
+                        if dialogues.is_empty() {
+                            println!("No dialogues found.");
+                        } else {
+                            for d in dialogues {
+                                let title = d.get("title").and_then(|v| v.as_str()).unwrap_or("?");
+                                let status = d.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                                println!("  {} [{}]", title, status);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        DialogueCommands::Export { dialogue_id, output } => {
+            let mut args = json!({ "dialogue_id": dialogue_id });
+            if let Some(path) = output {
+                args["output_path"] = json!(path);
+            }
+            match blue_mcp::handlers::dialogue::handle_export(&state, &args) {
+                Ok(result) => {
+                    if let Some(msg) = result.get("message").and_then(|v| v.as_str()) {
+                        println!("{}", msg);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Handle ADR subcommands
+async fn handle_adr_command(command: AdrCommands) -> Result<()> {
+    let mut state = get_project_state()?;
+
+    match command {
+        AdrCommands::Create { title } => {
+            let args = json!({ "title": title });
+            match blue_mcp::handlers::adr::handle_create(&mut state, &args) {
+                Ok(result) => {
+                    if let Some(msg) = result.get("message").and_then(|v| v.as_str()) {
+                        println!("{}", msg);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        AdrCommands::Get { title } => {
+            let args = json!({ "title": title });
+            match blue_mcp::handlers::adr::handle_get(&state, &args) {
+                Ok(result) => {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        AdrCommands::List => {
+            match blue_mcp::handlers::adr::handle_list(&state) {
+                Ok(result) => {
+                    if let Some(adrs) = result.get("adrs").and_then(|v| v.as_array()) {
+                        if adrs.is_empty() {
+                            println!("No ADRs found.");
+                        } else {
+                            for a in adrs {
+                                let number = a.get("number").and_then(|v| v.as_i64()).unwrap_or(0);
+                                let title = a.get("title").and_then(|v| v.as_str()).unwrap_or("?");
+                                let status = a.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                                println!("  {:04} {} [{}]", number, title, status);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        AdrCommands::Status { title, status: _status } => {
+            // Note: ADR status changes require editing the file directly
+            println!("To change ADR status, edit the ADR file directly.");
+            println!("Looking for ADR '{}'...", title);
+            let args = json!({ "title": title });
+            if let Ok(result) = blue_mcp::handlers::adr::handle_get(&state, &args) {
+                if let Some(file) = result.get("file_path").and_then(|v| v.as_str()) {
+                    println!("File: {}", file);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Handle spike subcommands
+async fn handle_spike_command(command: SpikeCommands) -> Result<()> {
+    let mut state = get_project_state()?;
+
+    match command {
+        SpikeCommands::Create { title, budget } => {
+            let args = json!({ "title": title, "budget_hours": budget });
+            match blue_mcp::handlers::spike::handle_create(&mut state, &args) {
+                Ok(result) => {
+                    if let Some(msg) = result.get("message").and_then(|v| v.as_str()) {
+                        println!("{}", msg);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        SpikeCommands::Get { title } => {
+            // Spike get/list not yet implemented - check .blue/docs/spikes/
+            println!("Spike details for '{}' - check .blue/docs/spikes/ directory", title);
+            println!("hint: Use `ls .blue/docs/spikes/` to see available spikes");
+        }
+        SpikeCommands::List => {
+            // Spike list not yet implemented - show directory hint
+            println!("Listing spikes from .blue/docs/spikes/");
+            let spike_dir = std::path::Path::new(".blue/docs/spikes");
+            if spike_dir.exists() {
+                for entry in std::fs::read_dir(spike_dir)? {
+                    let entry = entry?;
+                    let name = entry.file_name();
+                    println!("  {}", name.to_string_lossy());
+                }
+            } else {
+                println!("No spikes directory found.");
+            }
+        }
+        SpikeCommands::Complete { title, outcome } => {
+            let args = json!({ "title": title, "outcome": outcome });
+            match blue_mcp::handlers::spike::handle_complete(&mut state, &args) {
+                Ok(result) => {
+                    if let Some(msg) = result.get("message").and_then(|v| v.as_str()) {
+                        println!("{}", msg);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Handle audit subcommands
+async fn handle_audit_command(command: AuditCommands) -> Result<()> {
+    let state = get_project_state()?;
+
+    match command {
+        AuditCommands::Create { title } => {
+            let args = json!({ "title": title });
+            match blue_mcp::handlers::audit_doc::handle_create(&state, &args) {
+                Ok(result) => {
+                    if let Some(msg) = result.get("message").and_then(|v| v.as_str()) {
+                        println!("{}", msg);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        AuditCommands::Get { title } => {
+            let args = json!({ "title": title });
+            match blue_mcp::handlers::audit_doc::handle_get(&state, &args) {
+                Ok(result) => {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        AuditCommands::List => {
+            match blue_mcp::handlers::audit_doc::handle_list(&state) {
+                Ok(result) => {
+                    if let Some(audits) = result.get("audits").and_then(|v| v.as_array()) {
+                        if audits.is_empty() {
+                            println!("No audits found.");
+                        } else {
+                            for a in audits {
+                                let title = a.get("title").and_then(|v| v.as_str()).unwrap_or("?");
+                                let status = a.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                                println!("  {} [{}]", title, status);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Handle PRD subcommands
+async fn handle_prd_command(command: PrdCommands) -> Result<()> {
+    let state = get_project_state()?;
+
+    match command {
+        PrdCommands::Create { title } => {
+            let args = json!({ "title": title });
+            match blue_mcp::handlers::prd::handle_create(&state, &args) {
+                Ok(result) => {
+                    if let Some(msg) = result.get("message").and_then(|v| v.as_str()) {
+                        println!("{}", msg);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        PrdCommands::Get { title } => {
+            let args = json!({ "title": title });
+            match blue_mcp::handlers::prd::handle_get(&state, &args) {
+                Ok(result) => {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        PrdCommands::List => {
+            let args = json!({});
+            match blue_mcp::handlers::prd::handle_list(&state, &args) {
+                Ok(result) => {
+                    if let Some(prds) = result.get("prds").and_then(|v| v.as_array()) {
+                        if prds.is_empty() {
+                            println!("No PRDs found.");
+                        } else {
+                            for p in prds {
+                                let title = p.get("title").and_then(|v| v.as_str()).unwrap_or("?");
+                                let status = p.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                                println!("  {} [{}]", title, status);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Handle reminder subcommands
+async fn handle_reminder_command(command: ReminderCommands) -> Result<()> {
+    let state = get_project_state()?;
+
+    match command {
+        ReminderCommands::Create { message, when } => {
+            let args = json!({ "message": message, "when": when });
+            match blue_mcp::handlers::reminder::handle_create(&state, &args) {
+                Ok(result) => {
+                    if let Some(msg) = result.get("message").and_then(|v| v.as_str()) {
+                        println!("{}", msg);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        ReminderCommands::List => {
+            let args = json!({});
+            match blue_mcp::handlers::reminder::handle_list(&state, &args) {
+                Ok(result) => {
+                    if let Some(reminders) = result.get("reminders").and_then(|v| v.as_array()) {
+                        if reminders.is_empty() {
+                            println!("No reminders.");
+                        } else {
+                            for r in reminders {
+                                let id = r.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+                                let msg = r.get("message").and_then(|v| v.as_str()).unwrap_or("?");
+                                let due = r.get("due_at").and_then(|v| v.as_str()).unwrap_or("?");
+                                println!("  [{}] {} (due: {})", id, msg, due);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        ReminderCommands::Snooze { id, until } => {
+            let args = json!({ "id": id, "until": until });
+            match blue_mcp::handlers::reminder::handle_snooze(&state, &args) {
+                Ok(result) => {
+                    if let Some(msg) = result.get("message").and_then(|v| v.as_str()) {
+                        println!("{}", msg);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        ReminderCommands::Dismiss { id } => {
+            let args = json!({ "id": id });
+            match blue_mcp::handlers::reminder::handle_clear(&state, &args) {
+                Ok(result) => {
+                    if let Some(msg) = result.get("message").and_then(|v| v.as_str()) {
+                        println!("{}", msg);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    Ok(())
 }

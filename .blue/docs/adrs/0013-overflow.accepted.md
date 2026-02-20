@@ -32,6 +32,14 @@ Both produce output. Only one is sustainable. Only one is joyful.
 
 Persistence without overflow becomes extraction. Overflow without persistence becomes distraction. Both are needed. See ADR 0000.
 
+### When Claude Implements
+
+Overflow applies to **human judgment capacity**, not implementation toil.
+
+If Claude does the implementation work, the human's overflow comes from design thinking, architecture choice, and creative direction—not typing. Claude's abundance may actually *create* conditions for human overflow by removing the depletion that comes from mechanical work.
+
+The question shifts from "can I afford to build this?" to "should this be built?" See RFC 0039.
+
 ## How 💙 Embodies This
 
 💙 doesn't extract from you. It offers.
